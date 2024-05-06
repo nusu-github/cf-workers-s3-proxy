@@ -1,0 +1,15 @@
+name = "cloudflare-workers-s3-proxy"
+compatibility_date = "2023-12-01"
+compatibility_flags = ["brotli_content_encoding"]
+
+workers_dev = false
+upload_source_maps = true
+
+[placement]
+mode = "smart"
+
+[vars]
+RANGE_RETRY_ATTEMPTS = 3
+END_POINT = ""
+ACCESS_KEY = ""
+BUCKET_NAME = ""
