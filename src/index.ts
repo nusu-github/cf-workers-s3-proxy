@@ -1,6 +1,6 @@
-import { Hono } from "hono";
-import { AwsClient } from "aws4fetch";
-import { logger } from "hono/logger";
+import {Hono} from "hono";
+import {AwsClient} from "aws4fetch";
+import {logger} from "hono/logger";
 
 type Bindings = {
   RANGE_RETRY_ATTEMPTS: number;
