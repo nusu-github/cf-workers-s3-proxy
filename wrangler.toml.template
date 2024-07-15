@@ -10,6 +10,6 @@ mode = "smart"
 
 [vars]
 RANGE_RETRY_ATTEMPTS = 3
-END_POINT = ""
 ACCESS_KEY = ""
 BUCKET_NAME = ""
+END_POINT = ""

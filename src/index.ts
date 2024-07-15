@@ -27,55 +27,68 @@ app.get("/:filename{.*}", async (c) => {
 		service: "s3",
 	});
 
-	const req = await aws.sign(
-		`https://${c.env.END_POINT}/${c.env.BUCKET_NAME}/${filename}`,
-		{
-			method: "GET",
-			headers: c.res.headers,
-		},
-	);
+	const url = `https://${c.env.END_POINT}/${c.env.BUCKET_NAME}/${filename}`;
+	const rangeHeader = c.req.header("range");
 
-	if (req.headers.has("range")) {
+	const reqInit: RequestInit = {
+		method: "GET",
+		headers: {},
+	};
+
+	if (rangeHeader) {
+		reqInit.headers = {
+			Range: rangeHeader,
+		};
+	}
+
+	const signedRequest = await aws.sign(url, reqInit);
+
+	if (rangeHeader) {
 		let attempts = c.env.RANGE_RETRY_ATTEMPTS;
-		let response: Response;
+		let response: Response | Promise<Response> = c.notFound();
+
 		do {
 			const controller = new AbortController();
-			response = await fetch(req.url, {
-				method: req.method,
-				headers: req.headers,
-				signal: controller.signal,
-			});
+			try {
+				response = await fetch(signedRequest.url, {
+					method: signedRequest.method,
+					headers: signedRequest.headers,
+					signal: controller.signal,
+				});
 
-			if (response.headers.has("content-range")) {
-				if (attempts < c.env.RANGE_RETRY_ATTEMPTS) {
-					console.log(
-						`Retry for ${req.url} succeeded - response has content-range header`,
+				if (response.headers.has("content-range")) {
+					if (attempts < c.env.RANGE_RETRY_ATTEMPTS) {
+						console.log(
+							`Retry for ${url} succeeded - response has content-range header`,
+						);
+					}
+					return response;
+				}
+
+				if (response.ok) {
+					attempts -= 1;
+					console.error(
+						`Range header in request for ${url} but no content-range header in response. Will retry ${attempts} more times`,
 					);
+					if (attempts > 0) {
+						controller.abort();
+					}
+				} else {
+					break;
 				}
-				break;
-			}
-
-			if (response.ok) {
+			} catch (error) {
+				console.error(`Error during fetch for ${url}:`, error);
 				attempts -= 1;
-				console.error(
-					`Range header in request for ${req.url} but no content-range header in response. Will retry ${attempts} more times`,
-				);
-				if (attempts > 0) {
-					controller.abort();
-				}
-			} else {
-				break;
 			}
 		} while (attempts > 0);
-		if (attempts <= 0) {
-			console.error(
-				`Tried range request for ${req.url} ${c.env.RANGE_RETRY_ATTEMPTS} times, but no content-range in response.`,
-			);
-		}
+
+		console.error(
+			`Tried range request for ${url} ${c.env.RANGE_RETRY_ATTEMPTS} times, but no content-range in response.`,
+		);
 		return response;
 	}
 
-	return fetch(req);
+	return fetch(signedRequest);
 });
 
 export default app;
