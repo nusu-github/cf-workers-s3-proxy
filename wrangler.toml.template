@@ -1,6 +1,5 @@
 name = "cloudflare-workers-s3-proxy"
-compatibility_date = "2023-12-01"
-compatibility_flags = ["brotli_content_encoding"]
+compatibility_date = "2025-05-21"
 
 workers_dev = false
 upload_source_maps = true
@@ -9,7 +8,9 @@ upload_source_maps = true
 mode = "smart"
 
 [vars]
-RANGE_RETRY_ATTEMPTS = 3
+END_POINT = ""
 ACCESS_KEY = ""
 BUCKET_NAME = ""
-END_POINT = ""
+RANGE_RETRY_ATTEMPTS = 3
+CORS_ALLOW_ORIGINS = "*"
+VERSION = "v1.0.0"
