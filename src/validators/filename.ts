@@ -14,39 +14,36 @@ export const filenameValidator = validator(
       })
     }
 
-    // Hono automatically decodes path parameters. Path traversal checks are necessary.
-    // Normalize to handle mixed slashes and resolve '.' segments.
-    const normalizedPath = filename
-      .replace(/\\/g, "/")
-      .split("/")
-      .reduce((acc, part) => {
-        if (part === "..") {
-          acc.pop()
-        } else if (part !== "." && part !== "") {
-          acc.push(part)
-        }
-        return acc
-      }, [] as string[])
-      .join("/")
-
-    if (
-      normalizedPath.includes("..") ||
-      (filename !== normalizedPath && filename.includes(".."))
-    ) {
+    // Reject any path traversal attempts before normalization
+    if (filename.includes("..")) {
       throw new HTTPException(400, { message: "Path traversal detected" })
     }
 
-    // After normalization, if the path starts with '..' equivalent, it's an attempt to go above root.
-    const segments = filename
-      .replace(/\\/g, "/")
-      .split("/")
-      .filter((p) => p && p !== ".")
-    if (segments[0] === "..") {
+    // Check for backslashes (Windows path separators)
+    if (filename.includes("\\")) {
       throw new HTTPException(400, {
-        message: "Path traversal - attempt to go above root",
+        message: "Backslashes are not allowed in paths",
       })
     }
 
-    return { filename: normalizedPath } // Return the normalized path
+    // Normalize path by removing redundant slashes and empty segments
+    const normalizedPath = filename
+      .split("/")
+      .filter((part) => part !== "" && part !== ".")
+      .join("/")
+
+    // Additional security checks
+    if (normalizedPath.startsWith("/")) {
+      throw new HTTPException(400, {
+        message: "Absolute paths are not allowed",
+      })
+    }
+
+    // Validate the final normalized path doesn't contain problematic patterns
+    if (normalizedPath.includes("//") || normalizedPath.endsWith("/")) {
+      throw new HTTPException(400, { message: "Invalid path format" })
+    }
+
+    return { filename: normalizedPath }
   },
 )

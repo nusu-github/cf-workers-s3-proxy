@@ -8,6 +8,7 @@
     "dev": "wrangler dev src/index.ts",
     "deploy": "wrangler deploy --minify src/index.ts",
     "generate_signed_url": "node src/generate_signed_url.js",
+    "test:upload": "node test/upload-test.js",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",

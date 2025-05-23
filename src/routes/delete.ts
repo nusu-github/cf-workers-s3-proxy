@@ -82,7 +82,8 @@ deleteRoute.delete("/:filename{.*}", filenameValidator, async (c) => {
     }
 
     // Return the raw S3 response for any other successful status
-    return response
+    // Clone the response to avoid body consumption issues
+    return response.clone()
   } catch (error) {
     console.error("Delete error:", error)
 
@@ -183,7 +184,9 @@ ${xmlObjects}
 
       // Parse the response if not in quiet mode
       if (!quiet) {
-        const responseText = await response.text()
+        // Clone response before reading body to avoid consumption issues
+        const responseClone = response.clone()
+        const responseText = await responseClone.text()
         return new Response(responseText, {
           status: response.status,
           headers: response.headers,

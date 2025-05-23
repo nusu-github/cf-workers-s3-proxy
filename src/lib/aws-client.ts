@@ -128,7 +128,8 @@ async function performS3FetchAttempt(
   // Update metrics for successful responses
   if (handledResponse.ok) {
     updateResponseMetrics(handledResponse)
-    return new Response(handledResponse.body, handledResponse)
+    // Clone the response to avoid "Body has already been used" errors
+    return handledResponse.clone()
   }
 
   return handledResponse

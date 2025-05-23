@@ -20,7 +20,7 @@ function validateFileAccess(
   pathname: string,
   requestUrl: string,
 ): Promise<void> {
-  if (shouldEnforceUrlSigning(env, pathname) || env.URL_SIGNING_SECRET) {
+  if (shouldEnforceUrlSigning(env, pathname)) {
     if (!env.URL_SIGNING_SECRET) {
       throw new HTTPException(501, {
         message: "URL signing is required but not configured",
@@ -110,13 +110,28 @@ function enhanceResponse(
   cacheResult: Awaited<ReturnType<typeof cachedS3Fetch>>["cacheResult"],
   version: string | undefined,
 ): Response {
-  // Enhanced response headers
-  if (config.debug && cacheResult) {
-    response.headers.set("X-Cache-Debug", JSON.stringify(cacheResult))
-  }
+  // Check if we need to add any headers
+  const needsDebugHeader = config.debug && cacheResult
+  const needsVersionHeader = true // Always add version header
 
-  // Add custom headers for debugging
-  response.headers.set("X-Proxy-Version", version || "dev")
+  if (needsDebugHeader || needsVersionHeader) {
+    // Create new response with mutable headers to avoid immutable header errors
+    const enhancedResponse = new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: new Headers(response.headers),
+    })
+
+    // Add headers to the new mutable response
+    if (needsDebugHeader) {
+      enhancedResponse.headers.set("X-Cache-Debug", JSON.stringify(cacheResult))
+    }
+    if (needsVersionHeader) {
+      enhancedResponse.headers.set("X-Proxy-Version", version || "dev")
+    }
+
+    return enhancedResponse
+  }
 
   return response
 }

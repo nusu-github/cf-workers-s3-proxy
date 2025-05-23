@@ -1,0 +1,21 @@
+{
+  "name": "s3-proxy-upload-tests",
+  "version": "1.0.0",
+  "description": "Upload functionality tests for CloudFlare Workers S3 Proxy",
+  "type": "module",
+  "main": "upload-test.js",
+  "scripts": {
+    "test": "node upload-test.js",
+    "test:verbose": "DEBUG=1 node upload-test.js",
+    "test:signed": "URL_SIGNING_SECRET=${URL_SIGNING_SECRET} node upload-test.js"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^4.3.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["s3", "proxy", "upload", "test", "cloudflare-workers"],
+  "author": "S3 Proxy Test Suite",
+  "license": "MIT"
+}

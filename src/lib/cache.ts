@@ -250,8 +250,8 @@ async function handleCacheApiRequest(
       console.log("Cache hit from Cache API")
     }
 
-    // Clone the response and add cache debug headers
-    const response = new Response(cachedResponse.body, cachedResponse)
+    // Clone the response and add cache debug headers - use clone() to avoid body consumption issues
+    const response = cachedResponse.clone()
     if (config.debug) {
       response.headers.set(
         "X-Cache-Debug",
@@ -317,14 +317,20 @@ async function storeInCacheApi(
 
   try {
     const ttl = calculateTtl(response, config)
-    const cacheResponse = new Response(response.body, response)
+    // Clone the response to avoid body consumption issues
+    const cacheResponse = response.clone()
 
-    // Add cache headers
-    cacheResponse.headers.set("Cache-Control", `max-age=${ttl}`)
-    cacheResponse.headers.set("X-Cache-Stored", new Date().toISOString())
+    // Add cache headers - create new response with modified headers to make them mutable
+    const responseWithHeaders = new Response(cacheResponse.body, {
+      status: cacheResponse.status,
+      statusText: cacheResponse.statusText,
+      headers: new Headers(cacheResponse.headers),
+    })
+    responseWithHeaders.headers.set("Cache-Control", `max-age=${ttl}`)
+    responseWithHeaders.headers.set("X-Cache-Stored", new Date().toISOString())
 
     // Store in Cache API (fire and forget)
-    cache.put(cacheRequest, cacheResponse).catch((putError) => {
+    cache.put(cacheRequest, responseWithHeaders).catch((putError) => {
       console.warn("Failed to store in Cache API:", putError)
       globalThis.__app_metrics.cacheErrors++
     })
@@ -464,10 +470,20 @@ export async function cachedS3Fetch(
         console.log(`CF-Cache-Status: ${cfCacheStatus}`)
       }
 
-      // Clone response and add debug headers
-      const response = new Response(res.body, res)
+      // Clone response and add debug headers - avoid body consumption issues
+      const response = res.clone()
       if (config.debug) {
-        response.headers.set("X-Cache-Debug", JSON.stringify(finalCacheResult))
+        // Create new response with mutable headers for debug info
+        const responseWithDebug = new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: new Headers(response.headers),
+        })
+        responseWithDebug.headers.set(
+          "X-Cache-Debug",
+          JSON.stringify(finalCacheResult),
+        )
+        return { response: responseWithDebug, cacheResult: finalCacheResult }
       }
 
       return { response, cacheResult: finalCacheResult }

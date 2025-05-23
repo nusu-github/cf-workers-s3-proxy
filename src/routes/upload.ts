@@ -182,7 +182,7 @@ upload.put("/:filename{.*}", filenameValidator, async (c) => {
 
     // Return the S3 response directly
     // This preserves all S3 headers like ETag, x-amz-version-id, etc.
-    return new Response(response.body, response)
+    return response
   } catch (error) {
     handleUploadError(error, "Upload failed")
   }
@@ -322,7 +322,7 @@ upload.post("/:filename{.*}/uploads", filenameValidator, async (c) => {
     }
 
     // Return the S3 response (contains UploadId in XML format)
-    return new Response(response.body, response)
+    return response
   } catch (error) {
     handleUploadError(error, "Multipart upload initiation failed")
   }
