@@ -1,5 +1,6 @@
 import { zValidator } from "@hono/zod-validator"
 import { Hono } from "hono"
+import type { Context } from "hono"
 import { HTTPException } from "hono/http-exception"
 import type { ContentfulStatusCode } from "hono/utils/http-status"
 import { z } from "zod"
@@ -133,6 +134,99 @@ function handleUploadError(error: unknown, context: string): never {
   })
 }
 
+/**
+ * Enhanced error handling for S3 responses with error details
+ */
+async function handleS3ResponseError(
+  response: Response,
+  context: string,
+): Promise<void> {
+  let errorDetails = ""
+  try {
+    errorDetails = await response.text()
+  } catch (readError) {
+    console.error("Failed to read error response:", readError)
+  }
+
+  const statusMessage = `${response.status} ${response.statusText}`
+  throw new HTTPException(response.status as ContentfulStatusCode, {
+    message: `${context}: ${statusMessage}${errorDetails ? ` - ${errorDetails}` : ""}`,
+  })
+}
+
+/**
+ * Handles multipart upload part request
+ */
+async function handleMultipartUploadPart(
+  c: Context<{ Bindings: Env }>,
+  filename: string,
+  partNumber: string,
+  uploadId: string,
+): Promise<Response> {
+  // Validate part number
+  const partNum = Number.parseInt(partNumber, 10)
+  if (Number.isNaN(partNum) || partNum < 1 || partNum > 10000) {
+    throw new HTTPException(400, {
+      message: "Invalid part number. Must be between 1 and 10000",
+    })
+  }
+
+  // Security: Enhanced URL signing enforcement
+  const pathname = `/${filename}`
+  validateUrlSigning(c.env, pathname)
+
+  if (shouldEnforceUrlSigning(c.env, pathname) && c.env.URL_SIGNING_SECRET) {
+    await verifySignature(new URL(c.req.url), c.env.URL_SIGNING_SECRET)
+  }
+
+  // Get the request body
+  const body = c.req.raw.body
+  if (!body) {
+    throw new HTTPException(400, {
+      message: "Request body is required for part upload",
+    })
+  }
+
+  try {
+    const signer = getAwsClient(c.env)
+    const url = `${getS3BaseUrl(c.env)}/${filename}?partNumber=${partNumber}&uploadId=${encodeURIComponent(uploadId)}`
+
+    // Forward relevant headers
+    const headers = new Headers()
+    const contentLength = c.req.header("content-length")
+    if (contentLength) {
+      headers.set("Content-Length", contentLength)
+    }
+
+    // Forward Content-MD5 if provided for part integrity
+    const contentMd5 = c.req.header("content-md5")
+    if (contentMd5) {
+      headers.set("Content-MD5", contentMd5)
+    }
+
+    // Sign and execute the part upload request
+    const signedRequest = await signer.sign(url, {
+      method: HttpMethod.PUT,
+      headers: headers,
+      body: body,
+    })
+
+    const response = await fetch(signedRequest)
+
+    if (!response.ok) {
+      await handleS3ResponseError(response, `Part ${partNumber} upload failed`)
+    }
+
+    // Track upload metrics for parts
+    updateUploadMetrics(contentLength)
+
+    // Return the S3 response (contains ETag)
+    return response
+  } catch (error) {
+    handleUploadError(error, `Part ${partNumber} upload failed`)
+  }
+}
+
 // Upload file - PUT /:filename
 upload.put("/:filename{.*}", filenameValidator, async (c) => {
   // Ensure environment is validated
@@ -184,7 +278,7 @@ upload.put("/:filename{.*}", filenameValidator, async (c) => {
     // This preserves all S3 headers like ETag, x-amz-version-id, etc.
     return response
   } catch (error) {
-    handleUploadError(error, "Upload failed")
+    await handleUploadError(error, "Upload failed")
   }
 })
 
@@ -316,15 +410,217 @@ upload.post("/:filename{.*}/uploads", filenameValidator, async (c) => {
     const response = await fetch(signedRequest)
 
     if (!response.ok) {
-      throw new HTTPException(response.status as ContentfulStatusCode, {
-        message: `Multipart upload initiation failed: ${response.statusText}`,
-      })
+      await handleS3ResponseError(
+        response,
+        "Multipart upload initiation failed",
+      )
     }
 
     // Return the S3 response (contains UploadId in XML format)
     return response
   } catch (error) {
-    handleUploadError(error, "Multipart upload initiation failed")
+    await handleUploadError(error, "Multipart upload initiation failed")
+  }
+})
+
+// Complete multipart upload - POST /:filename?uploadId=
+upload.post("/:filename{.*}", filenameValidator, async (c) => {
+  // Check if this is a complete multipart upload request
+  const uploadId = c.req.query("uploadId")
+
+  if (!uploadId) {
+    // If no uploadId, this might be a different POST endpoint
+    throw new HTTPException(400, {
+      message:
+        "Invalid request. For multipart completion, uploadId is required",
+    })
+  }
+
+  // Ensure environment is validated
+  ensureEnvironmentValidated(c.env)
+
+  globalThis.__app_metrics.totalRequests++
+
+  const validatedData = c.req.valid("param") as { filename: string }
+  const filename = validatedData.filename
+
+  // Security: Enhanced URL signing enforcement
+  const pathname = `/${filename}`
+  validateUrlSigning(c.env, pathname)
+
+  if (shouldEnforceUrlSigning(c.env, pathname) && c.env.URL_SIGNING_SECRET) {
+    await verifySignature(new URL(c.req.url), c.env.URL_SIGNING_SECRET)
+  }
+
+  // Get the request body (XML with part list)
+  const body = c.req.raw.body
+  if (!body) {
+    throw new HTTPException(400, {
+      message:
+        "Request body with part list is required for completing multipart upload",
+    })
+  }
+
+  try {
+    const signer = getAwsClient(c.env)
+    const url = `${getS3BaseUrl(c.env)}/${filename}?uploadId=${encodeURIComponent(uploadId)}`
+
+    // Set appropriate headers for completion request
+    const headers = new Headers()
+    headers.set("Content-Type", "application/xml")
+
+    const contentLength = c.req.header("content-length")
+    if (contentLength) {
+      headers.set("Content-Length", contentLength)
+    }
+
+    // Sign and execute the completion request
+    const signedRequest = await signer.sign(url, {
+      method: HttpMethod.POST,
+      headers: headers,
+      body: body,
+    })
+
+    const response = await fetch(signedRequest)
+
+    if (!response.ok) {
+      await handleS3ResponseError(
+        response,
+        "Multipart upload completion failed",
+      )
+    }
+
+    // Track completion metrics
+    globalThis.__app_metrics.totalUploads++
+
+    // Return the S3 response (contains completion XML)
+    return response
+  } catch (error) {
+    await handleUploadError(error, "Multipart upload completion failed")
+  }
+})
+
+// Combined PUT route - handles both regular uploads and multipart parts
+upload.put("/:filename{.*}", filenameValidator, async (c) => {
+  // Ensure environment is validated
+  ensureEnvironmentValidated(c.env)
+
+  globalThis.__app_metrics.totalRequests++
+
+  const validatedData = c.req.valid("param") as { filename: string }
+  const filename = validatedData.filename
+
+  // Check if this is a multipart upload part request
+  const partNumber = c.req.query("partNumber")
+  const uploadId = c.req.query("uploadId")
+
+  if (partNumber && uploadId) {
+    // Handle multipart upload part
+    return handleMultipartUploadPart(c, filename, partNumber, uploadId)
+  }
+
+  // Otherwise, handle regular file upload
+  // Security: Enhanced URL signing enforcement for uploads
+  const pathname = `/${filename}`
+  validateUrlSigning(c.env, pathname)
+
+  if (shouldEnforceUrlSigning(c.env, pathname) && c.env.URL_SIGNING_SECRET) {
+    await verifySignature(new URL(c.req.url), c.env.URL_SIGNING_SECRET)
+  }
+
+  // Get the request body stream
+  const body = c.req.raw.body
+  if (!body) {
+    throw new HTTPException(400, {
+      message: "Request body is required for PUT uploads",
+    })
+  }
+
+  // Forward S3-related headers
+  const headers = forwardS3Headers(c.req.raw.headers)
+
+  const signer = getAwsClient(c.env)
+  const url = `${getS3BaseUrl(c.env)}/${filename}`
+
+  try {
+    // Sign the request with the body stream
+    const signedRequest = await signer.sign(url, {
+      method: HttpMethod.PUT,
+      headers: headers,
+      body: body, // Stream the body directly
+    })
+
+    // Execute the upload request
+    const response = await fetch(signedRequest)
+
+    if (!response.ok) {
+      await handleS3ResponseError(response, "Upload failed")
+    }
+
+    // Track upload metrics
+    const contentLength = c.req.header("content-length")
+    updateUploadMetrics(contentLength)
+
+    // Return the S3 response directly
+    // This preserves all S3 headers like ETag, x-amz-version-id, etc.
+    return response
+  } catch (error) {
+    await handleUploadError(error, "Upload failed")
+  }
+})
+
+// Abort multipart upload - DELETE /:filename?uploadId=
+upload.delete("/:filename{.*}", filenameValidator, async (c) => {
+  // Check if this is an abort multipart upload request
+  const uploadId = c.req.query("uploadId")
+
+  if (!uploadId) {
+    // If no uploadId, this might be a regular file delete (should be handled by delete route)
+    throw new HTTPException(400, {
+      message: "Invalid request. For multipart abort, uploadId is required",
+    })
+  }
+
+  // Ensure environment is validated
+  ensureEnvironmentValidated(c.env)
+
+  globalThis.__app_metrics.totalRequests++
+
+  const validatedData = c.req.valid("param") as { filename: string }
+  const filename = validatedData.filename
+
+  // Security: Enhanced URL signing enforcement
+  const pathname = `/${filename}`
+  validateUrlSigning(c.env, pathname)
+
+  if (shouldEnforceUrlSigning(c.env, pathname) && c.env.URL_SIGNING_SECRET) {
+    await verifySignature(new URL(c.req.url), c.env.URL_SIGNING_SECRET)
+  }
+
+  try {
+    const signer = getAwsClient(c.env)
+    const url = `${getS3BaseUrl(c.env)}/${filename}?uploadId=${encodeURIComponent(uploadId)}`
+
+    // Sign and execute the abort request
+    const signedRequest = await signer.sign(url, {
+      method: HttpMethod.DELETE,
+    })
+
+    const response = await fetch(signedRequest)
+
+    if (!response.ok) {
+      await handleS3ResponseError(response, "Multipart upload abort failed")
+    }
+
+    // Return success response
+    return c.json({
+      success: true,
+      message: `Multipart upload for '${filename}' aborted successfully`,
+      uploadId: uploadId,
+      abortedAt: new Date().toISOString(),
+    })
+  } catch (error) {
+    await handleUploadError(error, "Multipart upload abort failed")
   }
 })
 
