@@ -1,2 +1,36 @@
+# Development Environment Variables Template
+# ==========================================
+# 
+# Copy this file to .dev.vars and fill in your actual values
+# These values are used for local development with 'wrangler dev'
+# 
+# For production deployment, use 'wrangler secret put' for these values:
+# wrangler secret put END_POINT
+# wrangler secret put ACCESS_KEY
+# wrangler secret put SECRET_KEY
+# wrangler secret put BUCKET_NAME
+# wrangler secret put S3_REGION
+# wrangler secret put URL_SIGNING_SECRET
+# wrangler secret put CACHE_PURGE_SECRET
+
+# Your S3-compatible endpoint (e.g., https://s3.us-west-1.amazonaws.com)
+END_POINT=
+
+# Your S3 access key ID
+ACCESS_KEY=
+
+# Your S3 secret access key
 SECRET_KEY=
-URL_SIGNING_SECRET=
+
+# Your S3 bucket name
+BUCKET_NAME=
+
+# Your S3 region (e.g., us-east-1, eu-west-1, ap-southeast-1)
+# This is now explicit instead of being parsed from the endpoint
+S3_REGION=
+
+# Secret for URL signing (enables signed URL authentication)
+URL_SIGNING_SECRET=your-secret-key-here
+
+# Secret for cache purging API (enables cache management)
+CACHE_PURGE_SECRET=your-purge-secret-here

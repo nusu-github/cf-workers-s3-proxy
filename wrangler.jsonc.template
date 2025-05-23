@@ -1,0 +1,118 @@
+{
+  // Cloudflare Workers S3 Proxy Configuration
+  // ===========================================
+  //
+  // SETUP INSTRUCTIONS:
+  // 1. Copy this file to wrangler.jsonc
+  // 2. Copy .dev.vars.template to .dev.vars and fill in sensitive values
+  // 3. For production, use 'wrangler secret put' for sensitive values:
+  //    - wrangler secret put END_POINT
+  //    - wrangler secret put ACCESS_KEY
+  //    - wrangler secret put SECRET_KEY
+  //    - wrangler secret put BUCKET_NAME
+  //    - wrangler secret put S3_REGION
+  //    - wrangler secret put URL_SIGNING_SECRET (if using signed URLs)
+  //    - wrangler secret put CACHE_PURGE_SECRET (if using cache purging)
+  //
+  // CONFIGURATION GUIDE:
+  // - Non-sensitive values are configured directly in this file's "vars" section
+  // - Sensitive values (credentials, endpoints, secrets) are handled via:
+  //   * .dev.vars for local development
+  //   * wrangler secrets for production deployment
+  //
+  "name": "cloudflare-workers-s3-proxy",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-05-08",
+  "observability": {
+    "enabled": true
+  },
+  "upload_source_maps": true,
+  "workers_dev": false,
+  /**
+   * Smart Placement
+   * Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
+   */
+  "placement": {
+    "mode": "smart"
+  },
+  /**
+   * Bindings
+   * Bindings allow your Worker to interact with resources on the Cloudflare Developer Platform, including
+   * databases, object storage, AI inference, real-time communication and more.
+   * https://developers.cloudflare.com/workers/runtime-apis/bindings/
+   */
+
+  /**
+   * Environment Variables
+   * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
+   */
+  "vars": {
+    // ===== RETRY CONFIGURATION =====
+    "RANGE_RETRY_ATTEMPTS": 3,
+    // Max retries for S3 range requests (integer: 1-10)
+
+    // ===== CORS CONFIGURATION =====
+    "CORS_ALLOW_ORIGINS": "*",
+    // Allowed origins: "*" for all, or comma-separated URLs
+
+    // ===== VERSION INFO =====
+    "VERSION": "v1.0.0",
+    // Version string returned by health check endpoint
+
+    // ===== CACHE CONFIGURATION =====
+    "CACHE_TTL_SECONDS": 3600,
+    // Default cache TTL in seconds (1 hour)
+    "CACHE_ENABLED": true,
+    // Enable/disable caching globally (boolean)
+    "CACHE_OVERRIDE_S3_HEADERS": false,
+    // Override S3 cache headers with our settings (boolean)
+    "CACHE_MIN_TTL_SECONDS": 60,
+    // Minimum cache TTL in seconds (1 minute)
+    "CACHE_MAX_TTL_SECONDS": 86400,
+    // Maximum cache TTL in seconds (24 hours)
+    "CACHE_DEBUG": false,
+    // Enable cache debug headers in responses (boolean)
+
+    // ===== SENSITIVE VALUES (DO NOT PUT HERE) =====
+    // The following values should be set via .dev.vars (local) or wrangler secrets (production):
+    // - END_POINT: Your S3-compatible endpoint (e.g., https://s3.us-west-1.amazonaws.com)
+    // - ACCESS_KEY: Your S3 access key ID
+    // - SECRET_KEY: Your S3 secret access key
+    // - BUCKET_NAME: Your S3 bucket name
+    // - S3_REGION: Your S3 region (e.g., us-east-1, eu-west-1)
+    // - URL_SIGNING_SECRET: Secret for URL signing (optional, for private access)
+    // - CACHE_PURGE_SECRET: Secret for cache purging API (optional)
+
+    // ===== FEATURE TOGGLES =====
+    "ENABLE_LIST_ENDPOINT": true,
+    // Enable/disable the S3 object listing endpoint (/list) (boolean)
+    "ENABLE_UPLOAD_ENDPOINT": true,
+    // Enable/disable all upload-related endpoints (PUT /*, /presigned-upload, /*/uploads) (boolean)
+    "ENABLE_DELETE_ENDPOINT": true,
+    // Enable/disable all delete-related endpoints (DELETE /*, /delete) (boolean)
+    "ENFORCE_URL_SIGNING": true,
+    // Enable/disable URL signing enforcement (boolean)
+    "PREFIX_MAX_LENGTH": 1024,
+    // Maximum length of the prefix parameter (integer)
+    "PREFIX_MAX_DEPTH": 50,
+    // Maximum depth of the prefix parameter (integer)
+    "URL_SIGNING_REQUIRED_PATHS": "/list"
+    // Required paths for URL signing (comma-separated list of paths)
+  }
+  /**
+   * Note: Use secrets to store sensitive data.
+   * https://developers.cloudflare.com/workers/configuration/secrets/
+   */
+
+  /**
+   * Static Assets
+   * https://developers.cloudflare.com/workers/static-assets/binding/
+   */
+  // "assets": { "directory": "./public/", "binding": "ASSETS" },
+
+  /**
+   * Service Bindings (communicate between multiple Workers)
+   * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
+   */
+  // "services": [{ "binding": "MY_SERVICE", "service": "my-service" }]
+}
