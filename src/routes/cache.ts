@@ -203,7 +203,7 @@ cache.get("/__cache/health", async (c) => {
 
   try {
     // Test cache functionality with a simple operation
-    const testKey = `cache-health-${Date.now()}`
+    const testKey = `https://cache.internal/health-test/${Date.now()}`
     const testResponse = new Response("cache-test", {
       headers: { "Content-Type": "text/plain" },
     })

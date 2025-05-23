@@ -76,16 +76,26 @@ export function generateCacheKey(
     }
   }
 
-  const baseKey = `${urlObj.pathname}${urlObj.search}`
-  let cacheKey =
-    headerParts.length > 0 ? `${baseKey}|${headerParts.join("|")}` : baseKey
+  // Create cache URL with fixed scheme and host to ensure valid URL
+  const cacheUrl = new URL("https://cache.internal")
+  cacheUrl.pathname = urlObj.pathname
 
-  // Add cache version if provided
-  if (version) {
-    cacheKey = `v${version}:${cacheKey}`
+  // Copy cleaned search parameters
+  for (const [name, value] of urlObj.searchParams) {
+    cacheUrl.searchParams.set(name, value)
   }
 
-  return cacheKey
+  // Add headers as query parameter if present
+  if (headerParts.length > 0) {
+    cacheUrl.searchParams.set("_cache_headers", headerParts.join("|"))
+  }
+
+  // Add version as query parameter if provided
+  if (version) {
+    cacheUrl.searchParams.set("_cache_version", version)
+  }
+
+  return cacheUrl.toString()
 }
 
 /**
@@ -241,7 +251,7 @@ async function handleCacheApiRequest(
     }
 
     // Clone the response and add cache debug headers
-    const response = cachedResponse.clone()
+    const response = new Response(cachedResponse.body, cachedResponse)
     if (config.debug) {
       response.headers.set(
         "X-Cache-Debug",
@@ -307,7 +317,7 @@ async function storeInCacheApi(
 
   try {
     const ttl = calculateTtl(response, config)
-    const cacheResponse = response.clone()
+    const cacheResponse = new Response(response.body, response)
 
     // Add cache headers
     cacheResponse.headers.set("Cache-Control", `max-age=${ttl}`)
@@ -475,6 +485,7 @@ export async function cachedS3Fetch(
 
 /**
  * Purge cache entries by pattern or specific key
+ * Note: pattern must be a valid URL (cache key) when using string pattern
  */
 export async function purgeCache(
   pattern: string | RegExp,
@@ -485,8 +496,21 @@ export async function purgeCache(
 
   try {
     if (typeof pattern === "string") {
-      // Purge specific key
-      const deleted = await cache.delete(pattern)
+      // Purge specific key - pattern must be a valid URL cache key
+      // If it's not a valid URL, attempt to create one for backwards compatibility
+      let cacheKey = pattern
+      try {
+        new URL(pattern) // Validate it's a valid URL
+      } catch {
+        // If not a valid URL, try to construct one
+        if (pattern.startsWith("/")) {
+          cacheKey = `https://cache.internal${pattern}`
+        } else {
+          cacheKey = `https://cache.internal/${pattern}`
+        }
+      }
+
+      const deleted = await cache.delete(cacheKey)
       if (deleted) {
         purged = 1
       }
