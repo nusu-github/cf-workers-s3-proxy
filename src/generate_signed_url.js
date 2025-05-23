@@ -23,28 +23,56 @@ function parseArguments() {
     help: false,
   }
 
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i]
-
-    if (arg === "-h" || arg === "--help") {
+  const argHandlers = {
+    "-h": () => {
       options.help = true
-    } else if (arg === "-e" || arg === "--expires") {
-      if (i + 1 >= args.length) {
+    },
+    "--help": () => {
+      options.help = true
+    },
+    "-e": (currentIndex) => {
+      if (currentIndex + 1 >= args.length) {
         console.error("Error: --expires requires a value")
         process.exit(1)
       }
-      const expiresValue = Number.parseInt(args[++i])
+      const expiresValue = Number.parseInt(args[currentIndex + 1])
       if (Number.isNaN(expiresValue) || expiresValue <= 0) {
         console.error("Error: --expires must be a positive number")
         process.exit(1)
       }
       options.expires = expiresValue
-    } else if (arg === "-j" || arg === "--json") {
+      return currentIndex + 1 // Consume next argument
+    },
+    "--expires": (currentIndex) => argHandlers["-e"](currentIndex),
+    "-j": () => {
       options.json = true
-    } else if (arg === "-q" || arg === "--quiet") {
+    },
+    "--json": () => {
+      options.json = true
+    },
+    "-q": () => {
       options.quiet = true
-    } else if (arg === "-v" || arg === "--verbose") {
+    },
+    "--quiet": () => {
+      options.quiet = true
+    },
+    "-v": () => {
       options.verbose = true
+    },
+    "--verbose": () => {
+      options.verbose = true
+    },
+  }
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]
+
+    if (argHandlers[arg]) {
+      const result = argHandlers[arg](i)
+      // If the handler returned a new index, it means it consumed the next argument(s)
+      if (typeof result === "number") {
+        i = result
+      }
     } else if (arg.startsWith("-")) {
       console.error(`Error: Unknown option: ${arg}`)
       showUsage()

@@ -27,7 +27,10 @@ const warmSchema = z.object({
 /**
  * Validates cache operation authentication
  */
-async function validateCacheAuth(c: Context<{ Bindings: Env }>, endpoint: string): Promise<void> {
+async function validateCacheAuth(
+  c: Context<{ Bindings: Env }>,
+  endpoint: string,
+): Promise<void> {
   const purgeSecret = c.env.CACHE_PURGE_SECRET
   if (!purgeSecret) {
     throw new HTTPException(501, {
@@ -38,7 +41,7 @@ async function validateCacheAuth(c: Context<{ Bindings: Env }>, endpoint: string
   // Check Bearer token first
   const authHeader = c.req.header("authorization")
   const providedSecret = authHeader?.replace("Bearer ", "")
-  
+
   if (providedSecret === purgeSecret) {
     return // Authentication successful
   }
@@ -61,7 +64,9 @@ async function validateCacheAuth(c: Context<{ Bindings: Env }>, endpoint: string
 /**
  * Executes purge operation based on request data
  */
-async function executePurgeOperation(data: z.infer<typeof purgeSchema>): Promise<{ totalPurged: number; errors: string[] }> {
+async function executePurgeOperation(
+  data: z.infer<typeof purgeSchema>,
+): Promise<{ totalPurged: number; errors: string[] }> {
   const { keys, pattern, all } = data
   let totalPurged = 0
   const errors: string[] = []
@@ -86,7 +91,7 @@ async function executePurgeOperation(data: z.infer<typeof purgeSchema>): Promise
 // Cache purge endpoint - POST /__cache/purge
 cache.post("/__cache/purge", zValidator("json", purgeSchema), async (c) => {
   ensureEnvironmentValidated(c.env)
-  
+
   await validateCacheAuth(c, "/__cache/purge")
 
   try {
@@ -110,7 +115,7 @@ cache.post("/__cache/purge", zValidator("json", purgeSchema), async (c) => {
 // Cache warming endpoint - POST /__cache/warm
 cache.post("/__cache/warm", zValidator("json", warmSchema), async (c) => {
   ensureEnvironmentValidated(c.env)
-  
+
   await validateCacheAuth(c, "/__cache/warm")
 
   try {

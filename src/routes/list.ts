@@ -25,7 +25,9 @@ const list = new Hono<{ Bindings: Env }>()
 /**
  * Validates URL signing for list endpoint
  */
-async function validateListAccess(c: Context<{ Bindings: Env }>): Promise<void> {
+async function validateListAccess(
+  c: Context<{ Bindings: Env }>,
+): Promise<void> {
   if (shouldEnforceUrlSigning(c.env, "/list")) {
     if (!c.env.URL_SIGNING_SECRET) {
       throw new HTTPException(501, {
@@ -68,7 +70,7 @@ function mapS3ErrorToHttpStatus(errorCode: string): ContentfulStatusCode {
 function handleS3Error(parsedXml: S3ErrorResponse): never {
   const s3Error = parsedXml.Error
   console.error("S3 returned error:", s3Error)
-  
+
   const statusCode = mapS3ErrorToHttpStatus(s3Error.Code)
   throw new HTTPException(statusCode, {
     message: `S3 Error: ${s3Error.Code} - ${s3Error.Message}`,
@@ -78,7 +80,9 @@ function handleS3Error(parsedXml: S3ErrorResponse): never {
 /**
  * Processes S3 contents into standardized object metadata
  */
-function processS3Contents(contents: S3ObjectMetadata | S3ObjectMetadata[] | undefined): S3ObjectMetadata[] {
+function processS3Contents(
+  contents: S3ObjectMetadata | S3ObjectMetadata[] | undefined,
+): S3ObjectMetadata[] {
   if (!contents) return []
 
   try {
@@ -95,18 +99,20 @@ function processS3Contents(contents: S3ObjectMetadata | S3ObjectMetadata[] | und
           }
         })
         .filter((obj): obj is S3ObjectMetadata => obj !== null)
-    } 
-    
-    if (typeof contents === "object" && contents.Key?.length > 0) {
-      return [{
-        Key: contents.Key,
-        LastModified: contents.LastModified || "",
-        ETag: contents.ETag || "",
-        Size: contents.Size,
-        StorageClass: contents.StorageClass || "STANDARD",
-      }]
     }
-    
+
+    if (typeof contents === "object" && contents.Key?.length > 0) {
+      return [
+        {
+          Key: contents.Key,
+          LastModified: contents.LastModified || "",
+          ETag: contents.ETag || "",
+          Size: contents.Size,
+          StorageClass: contents.StorageClass || "STANDARD",
+        },
+      ]
+    }
+
     return []
   } catch (processingError) {
     console.error("Error processing S3 contents:", processingError)
@@ -182,19 +188,22 @@ list.get("/list", async (c) => {
 
   // Validate content type
   const contentType = resp.headers.get("content-type") || ""
-  if (!contentType.includes("xml") && !contentType.includes("application/xml")) {
+  if (
+    !contentType.includes("xml") &&
+    !contentType.includes("application/xml")
+  ) {
     console.warn(`Unexpected content-type for S3 list response: ${contentType}`)
   }
 
   const xmlData = await resp.text()
   const parsedXml = parseS3Response(xmlData)
-  
+
   if (!parsedXml.ListBucketResult) {
     throw new HTTPException(502, {
       message: "Invalid response structure from S3",
     })
   }
-  
+
   const listResult = parsedXml.ListBucketResult
   const objects = processS3Contents(listResult.Contents)
 
@@ -203,7 +212,10 @@ list.get("/list", async (c) => {
     objects: objects,
     isTruncated: Boolean(listResult.IsTruncated),
     prefix: prefix,
-    keyCount: typeof listResult.KeyCount === "number" ? listResult.KeyCount : objects.length,
+    keyCount:
+      typeof listResult.KeyCount === "number"
+        ? listResult.KeyCount
+        : objects.length,
   }
 
   // Include next continuation token if pagination is available
@@ -213,7 +225,9 @@ list.get("/list", async (c) => {
 
   // Add debug logging if needed
   if (c.env.CACHE_DEBUG) {
-    console.log(`S3 list response processed: ${objects.length} objects found, isTruncated: ${response.isTruncated}`)
+    console.log(
+      `S3 list response processed: ${objects.length} objects found, isTruncated: ${response.isTruncated}`,
+    )
     if (response.nextContinuationToken) {
       console.log(`Next continuation token: ${response.nextContinuationToken}`)
     }
