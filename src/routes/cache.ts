@@ -1,5 +1,6 @@
 import { zValidator } from "@hono/zod-validator"
 import { Hono } from "hono"
+import type { Context } from "hono"
 import { HTTPException } from "hono/http-exception"
 import { z } from "zod"
 import { getCacheConfig, purgeCache, warmCache } from "../lib/cache.js"
@@ -23,60 +24,74 @@ const warmSchema = z.object({
   urls: z.array(z.string().url()).min(1, "At least one URL is required"),
 })
 
-// Cache purge endpoint - POST /__cache/purge
-cache.post("/__cache/purge", zValidator("json", purgeSchema), async (c) => {
-  ensureEnvironmentValidated(c.env)
-
-  // Security: Require purge secret for cache operations
+/**
+ * Validates cache operation authentication
+ */
+async function validateCacheAuth(c: Context<{ Bindings: Env }>, endpoint: string): Promise<void> {
   const purgeSecret = c.env.CACHE_PURGE_SECRET
   if (!purgeSecret) {
     throw new HTTPException(501, {
-      message: "Cache purging is not configured",
+      message: "Cache operations are not configured",
     })
   }
 
-  // Verify authorization header or URL signing
+  // Check Bearer token first
   const authHeader = c.req.header("authorization")
   const providedSecret = authHeader?.replace("Bearer ", "")
-
-  if (providedSecret !== purgeSecret) {
-    // Check URL signing as fallback
-    if (shouldEnforceUrlSigning(c.env, "/__cache/purge")) {
-      if (!c.env.URL_SIGNING_SECRET) {
-        throw new HTTPException(403, {
-          message: "Authentication required for cache purge",
-        })
-      }
-      await verifySignature(new URL(c.req.url), c.env.URL_SIGNING_SECRET)
-    } else {
-      throw new HTTPException(403, {
-        message: "Invalid cache purge secret",
-      })
-    }
+  
+  if (providedSecret === purgeSecret) {
+    return // Authentication successful
   }
 
-  try {
-    const { keys, pattern, all } = c.req.valid("json")
-    let totalPurged = 0
-    const errors: string[] = []
+  // Fallback to URL signing
+  if (shouldEnforceUrlSigning(c.env, endpoint)) {
+    if (!c.env.URL_SIGNING_SECRET) {
+      throw new HTTPException(403, {
+        message: "Authentication required for cache operation",
+      })
+    }
+    await verifySignature(new URL(c.req.url), c.env.URL_SIGNING_SECRET)
+  } else {
+    throw new HTTPException(403, {
+      message: "Invalid cache operation secret",
+    })
+  }
+}
 
-    if (all) {
-      // Note: Purging all cache entries is not directly supported by Cache API
-      // This would require maintaining a cache key registry
-      errors.push("Purging all cache entries requires custom implementation")
-    } else if (keys) {
-      // Purge specific keys
-      for (const key of keys) {
-        const result = await purgeCache(key)
-        totalPurged += result.purged
-        errors.push(...result.errors)
-      }
-    } else if (pattern) {
-      // Purge by pattern
-      const result = await purgeCache(new RegExp(pattern))
+/**
+ * Executes purge operation based on request data
+ */
+async function executePurgeOperation(data: z.infer<typeof purgeSchema>): Promise<{ totalPurged: number; errors: string[] }> {
+  const { keys, pattern, all } = data
+  let totalPurged = 0
+  const errors: string[] = []
+
+  if (all) {
+    errors.push("Purging all cache entries requires custom implementation")
+  } else if (keys) {
+    for (const key of keys) {
+      const result = await purgeCache(key)
       totalPurged += result.purged
       errors.push(...result.errors)
     }
+  } else if (pattern) {
+    const result = await purgeCache(new RegExp(pattern))
+    totalPurged += result.purged
+    errors.push(...result.errors)
+  }
+
+  return { totalPurged, errors }
+}
+
+// Cache purge endpoint - POST /__cache/purge
+cache.post("/__cache/purge", zValidator("json", purgeSchema), async (c) => {
+  ensureEnvironmentValidated(c.env)
+  
+  await validateCacheAuth(c, "/__cache/purge")
+
+  try {
+    const data = c.req.valid("json")
+    const { totalPurged, errors } = await executePurgeOperation(data)
 
     return c.json({
       success: true,
@@ -95,33 +110,8 @@ cache.post("/__cache/purge", zValidator("json", purgeSchema), async (c) => {
 // Cache warming endpoint - POST /__cache/warm
 cache.post("/__cache/warm", zValidator("json", warmSchema), async (c) => {
   ensureEnvironmentValidated(c.env)
-
-  // Security: Require purge secret for cache operations
-  const purgeSecret = c.env.CACHE_PURGE_SECRET
-  if (!purgeSecret) {
-    throw new HTTPException(501, {
-      message: "Cache operations are not configured",
-    })
-  }
-
-  // Verify authorization
-  const authHeader = c.req.header("authorization")
-  const providedSecret = authHeader?.replace("Bearer ", "")
-
-  if (providedSecret !== purgeSecret) {
-    if (shouldEnforceUrlSigning(c.env, "/__cache/warm")) {
-      if (!c.env.URL_SIGNING_SECRET) {
-        throw new HTTPException(403, {
-          message: "Authentication required for cache warming",
-        })
-      }
-      await verifySignature(new URL(c.req.url), c.env.URL_SIGNING_SECRET)
-    } else {
-      throw new HTTPException(403, {
-        message: "Invalid cache operation secret",
-      })
-    }
-  }
+  
+  await validateCacheAuth(c, "/__cache/warm")
 
   try {
     const { urls } = c.req.valid("json")

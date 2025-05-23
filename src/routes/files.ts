@@ -1,4 +1,5 @@
 import { Hono } from "hono"
+import type { Context } from "hono"
 import { HTTPException } from "hono/http-exception"
 import { getAwsClient, getS3BaseUrl } from "../lib/aws-client.js"
 import { cachedS3Fetch, getCacheConfig } from "../lib/cache.js"
@@ -11,34 +12,33 @@ import { filenameValidator } from "../validators/filename.js"
 
 const files = new Hono<{ Bindings: Env }>()
 
-// Enhanced handler for GET requests with better Hono features
-files.get("/:filename{.*}", filenameValidator, async (c) => {
-  // Ensure environment is validated (fail-fast behavior)
-  ensureEnvironmentValidated(c.env)
-
-  globalThis.__app_metrics.totalRequests++
-
-  const validatedData = c.req.valid("param") as { filename: string }
-  const filename = validatedData.filename
-
-  // Security: Enhanced URL signing enforcement
-  const pathname = `/${filename}`
-  if (shouldEnforceUrlSigning(c.env, pathname) || c.env.URL_SIGNING_SECRET) {
-    if (!c.env.URL_SIGNING_SECRET) {
+/**
+ * Validates URL signing for file access
+ */
+function validateFileAccess(
+  env: Env,
+  pathname: string,
+  requestUrl: string,
+): Promise<void> {
+  if (shouldEnforceUrlSigning(env, pathname) || env.URL_SIGNING_SECRET) {
+    if (!env.URL_SIGNING_SECRET) {
       throw new HTTPException(501, {
         message: "URL signing is required but not configured",
       })
     }
-    await verifySignature(new URL(c.req.url), c.env.URL_SIGNING_SECRET)
+    return verifySignature(new URL(requestUrl), env.URL_SIGNING_SECRET)
   }
+  return Promise.resolve()
+}
 
-  const method = c.req.raw.method as HttpMethod
-  const signer = getAwsClient(c.env)
-  const url = `${getS3BaseUrl(c.env)}/${filename}`
-  const rangeHeader = c.req.header("range")
+/**
+ * Builds request headers for S3 fetch
+ */
+function buildRequestHeaders(c: Context<{ Bindings: Env }>): Headers {
   const headers = new Headers()
 
   // Enhanced header handling
+  const rangeHeader = c.req.header("range")
   if (rangeHeader) {
     headers.set("Range", rangeHeader)
   }
@@ -53,21 +53,18 @@ files.get("/:filename{.*}", filenameValidator, async (c) => {
     headers.set("If-Modified-Since", ifModifiedSince)
   }
 
-  // Debug logging for conditional requests
-  const config = getCacheConfig(c.env)
-  if (config.debug) {
-    const conditionalHeaders = []
-    if (ifNoneMatch) conditionalHeaders.push(`If-None-Match: ${ifNoneMatch}`)
-    if (ifModifiedSince)
-      conditionalHeaders.push(`If-Modified-Since: ${ifModifiedSince}`)
-    if (conditionalHeaders.length > 0) {
-      console.log(
-        `Processing conditional request with headers: ${conditionalHeaders.join(", ")}`,
-      )
-    }
-  }
+  return headers
+}
 
-  // Handle download disposition for GET requests
+/**
+ * Handles download disposition headers
+ */
+function handleDownloadDisposition(
+  c: Context<{ Bindings: Env }>,
+  method: HttpMethod,
+  filename: string,
+  headers: Headers,
+): void {
   if (method === HttpMethod.GET) {
     if (c.req.query("download") !== undefined) {
       const defaultName = filename.split("/").pop() || "download"
@@ -81,6 +78,78 @@ files.get("/:filename{.*}", filenameValidator, async (c) => {
       headers.set("Content-Disposition", "inline")
     }
   }
+}
+
+/**
+ * Logs conditional request headers for debugging
+ */
+function logConditionalHeaders(
+  config: ReturnType<typeof getCacheConfig>,
+  ifNoneMatch: string | undefined,
+  ifModifiedSince: string | undefined,
+): void {
+  if (config.debug) {
+    const conditionalHeaders = []
+    if (ifNoneMatch) conditionalHeaders.push(`If-None-Match: ${ifNoneMatch}`)
+    if (ifModifiedSince)
+      conditionalHeaders.push(`If-Modified-Since: ${ifModifiedSince}`)
+    if (conditionalHeaders.length > 0) {
+      console.log(
+        `Processing conditional request with headers: ${conditionalHeaders.join(", ")}`,
+      )
+    }
+  }
+}
+
+/**
+ * Enhances response with debug headers
+ */
+function enhanceResponse(
+  response: Response,
+  config: ReturnType<typeof getCacheConfig>,
+  cacheResult: Awaited<ReturnType<typeof cachedS3Fetch>>["cacheResult"],
+  version: string | undefined,
+): Response {
+  // Enhanced response headers
+  if (config.debug && cacheResult) {
+    response.headers.set("X-Cache-Debug", JSON.stringify(cacheResult))
+  }
+
+  // Add custom headers for debugging
+  response.headers.set("X-Proxy-Version", version || "dev")
+
+  return response
+}
+
+// Enhanced handler for GET requests with better Hono features
+files.get("/:filename{.*}", filenameValidator, async (c) => {
+  // Ensure environment is validated (fail-fast behavior)
+  ensureEnvironmentValidated(c.env)
+
+  globalThis.__app_metrics.totalRequests++
+
+  const validatedData = c.req.valid("param") as { filename: string }
+  const filename = validatedData.filename
+
+  // Security: Enhanced URL signing enforcement
+  const pathname = `/${filename}`
+  await validateFileAccess(c.env, pathname, c.req.url)
+
+  const method = c.req.raw.method as HttpMethod
+  const signer = getAwsClient(c.env)
+  const url = `${getS3BaseUrl(c.env)}/${filename}`
+
+  // Build request headers
+  const headers = buildRequestHeaders(c)
+
+  // Handle download disposition
+  handleDownloadDisposition(c, method, filename, headers)
+
+  // Debug logging for conditional requests
+  const config = getCacheConfig(c.env)
+  const ifNoneMatch = c.req.header("if-none-match")
+  const ifModifiedSince = c.req.header("if-modified-since")
+  logConditionalHeaders(config, ifNoneMatch, ifModifiedSince)
 
   try {
     const { response, cacheResult } = await cachedS3Fetch(
@@ -93,15 +162,7 @@ files.get("/:filename{.*}", filenameValidator, async (c) => {
       c.req.raw,
     )
 
-    // Enhanced response headers
-    if (config.debug && cacheResult) {
-      response.headers.set("X-Cache-Debug", JSON.stringify(cacheResult))
-    }
-
-    // Add custom headers for debugging
-    response.headers.set("X-Proxy-Version", c.env.VERSION || "dev")
-
-    return response
+    return enhanceResponse(response, config, cacheResult, c.env.VERSION)
   } catch (error) {
     console.error(`File retrieval error for ${filename}:`, error)
 

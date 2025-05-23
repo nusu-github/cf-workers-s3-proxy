@@ -30,6 +30,17 @@ const numberFromEnv = z.union([z.number(), z.string()]).transform((val) => {
   return num
 })
 
+/**
+ * Creates a number schema with range validation
+ */
+function numberWithRange(min: number, max: number) {
+  return numberFromEnv
+    .refine((val) => val >= min && val <= max, {
+      message: `must be >= ${min} and <= ${max}`,
+    })
+    .optional()
+}
+
 // URL validation with proper error messages
 const httpUrlSchema = z
   .string()
@@ -160,36 +171,12 @@ const envSchema = z
       message: "must be a valid integer between 1 and 10",
     }),
 
-    // Optional numeric variables with ranges
-    CACHE_TTL_SECONDS: numberFromEnv
-      .refine((val) => val >= 1 && val <= 604800, {
-        message: "must be >= 1 and <= 604800",
-      })
-      .optional(),
-
-    CACHE_MIN_TTL_SECONDS: numberFromEnv
-      .refine((val) => val >= 1 && val <= 86400, {
-        message: "must be >= 1 and <= 86400",
-      })
-      .optional(),
-
-    CACHE_MAX_TTL_SECONDS: numberFromEnv
-      .refine((val) => val >= 60 && val <= 604800, {
-        message: "must be >= 60 and <= 604800",
-      })
-      .optional(),
-
-    PREFIX_MAX_LENGTH: numberFromEnv
-      .refine((val) => val >= 1 && val <= 1024, {
-        message: "must be >= 1 and <= 1024",
-      })
-      .optional(),
-
-    PREFIX_MAX_DEPTH: numberFromEnv
-      .refine((val) => val >= 1 && val <= 50, {
-        message: "must be >= 1 and <= 50",
-      })
-      .optional(),
+    // Optional numeric variables with ranges - using helper function
+    CACHE_TTL_SECONDS: numberWithRange(1, 604800),
+    CACHE_MIN_TTL_SECONDS: numberWithRange(1, 86400),
+    CACHE_MAX_TTL_SECONDS: numberWithRange(60, 604800),
+    PREFIX_MAX_LENGTH: numberWithRange(1, 1024),
+    PREFIX_MAX_DEPTH: numberWithRange(1, 50),
 
     // Boolean variables
     CACHE_ENABLED: booleanFromEnv,

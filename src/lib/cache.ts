@@ -199,6 +199,180 @@ export function handleConditionalRequest(
 }
 
 /**
+ * Handles cache API operations and conditional requests
+ */
+async function handleCacheApiRequest(
+  cache: Cache,
+  cacheRequest: Request,
+  request: Request | undefined,
+  config: CacheConfig,
+  cacheKey: string,
+): Promise<{ response: Response; cacheResult: CacheResult } | null> {
+  try {
+    const cachedResponse = await cache.match(cacheRequest)
+    if (!cachedResponse) return null
+
+    // Handle conditional requests if original request is provided
+    if (request) {
+      const conditionalResponse = handleConditionalRequest(
+        request,
+        cachedResponse,
+      )
+      if (conditionalResponse) {
+        globalThis.__app_metrics.notModifiedResponses++
+        return {
+          response: conditionalResponse,
+          cacheResult: { hit: true, source: "cache", key: cacheKey },
+        }
+      }
+    }
+
+    // Update cache metrics
+    globalThis.__app_metrics.cacheHits++
+    const contentLength = Number(
+      cachedResponse.headers.get("content-length") ?? "0",
+    )
+    if (contentLength > 0) {
+      globalThis.__app_metrics.cacheBytesServed += contentLength
+    }
+
+    if (config.debug) {
+      console.log("Cache hit from Cache API")
+    }
+
+    // Clone the response and add cache debug headers
+    const response = cachedResponse.clone()
+    if (config.debug) {
+      response.headers.set(
+        "X-Cache-Debug",
+        JSON.stringify({
+          hit: true,
+          source: "cache-api",
+          key: cacheKey,
+        }),
+      )
+    }
+
+    return {
+      response,
+      cacheResult: { hit: true, source: "cache", key: cacheKey },
+    }
+  } catch (cacheError) {
+    console.warn("Cache API error:", cacheError)
+    globalThis.__app_metrics.cacheErrors++
+    return null
+  }
+}
+
+/**
+ * Updates metrics based on cache status and response
+ */
+function updateCacheMetrics(
+  cfCacheStatus: string | null,
+  contentLength: number,
+): boolean {
+  const isEdgeHit = cfCacheStatus === "HIT"
+
+  if (isEdgeHit) {
+    globalThis.__app_metrics.cacheHits++
+    if (contentLength > 0) {
+      globalThis.__app_metrics.cacheBytesServed += contentLength
+    }
+  } else {
+    globalThis.__app_metrics.cacheMisses++
+  }
+
+  // Update general metrics
+  if (contentLength > 0) {
+    globalThis.__app_metrics.bytesSent += contentLength
+  }
+
+  return isEdgeHit
+}
+
+/**
+ * Stores response in Cache API if applicable
+ */
+async function storeInCacheApi(
+  response: Response,
+  method: HttpMethod,
+  cache: Cache,
+  cacheRequest: Request,
+  config: CacheConfig,
+  isEdgeHit: boolean,
+): Promise<void> {
+  if (!response.ok || !canCache(response, method) || isEdgeHit) {
+    return
+  }
+
+  try {
+    const ttl = calculateTtl(response, config)
+    const cacheResponse = response.clone()
+
+    // Add cache headers
+    cacheResponse.headers.set("Cache-Control", `max-age=${ttl}`)
+    cacheResponse.headers.set("X-Cache-Stored", new Date().toISOString())
+
+    // Store in Cache API (fire and forget)
+    cache.put(cacheRequest, cacheResponse).catch((putError) => {
+      console.warn("Failed to store in Cache API:", putError)
+      globalThis.__app_metrics.cacheErrors++
+    })
+
+    globalThis.__app_metrics.cacheStores++
+  } catch (storeError) {
+    console.warn("Cache storage error:", storeError)
+    globalThis.__app_metrics.cacheErrors++
+  }
+}
+
+/**
+ * Performs a single fetch attempt with proper error handling
+ */
+async function performFetchAttempt(
+  signer: AwsClient,
+  url: string,
+  method: HttpMethod,
+  headers: Headers,
+  config: CacheConfig,
+  cacheKey: string,
+): Promise<Response> {
+  const signedRequest = await signer.sign(url, {
+    method,
+    headers: headers,
+  })
+
+  // Use fetch with cf options for edge caching as fallback
+  const fetchOptions: RequestInit & { cf?: CfProperties } = {
+    method,
+    headers: signedRequest.headers,
+    cf: {
+      // Use custom cache key
+      cacheKey: cacheKey,
+      // Cache everything for the calculated TTL
+      cacheTtl: config.ttlSeconds,
+      // Enable caching regardless of response headers
+      cacheEverything: true,
+    },
+  }
+
+  const res = await fetch(signedRequest.url, fetchOptions)
+
+  // Handle range request validation
+  if (method === HttpMethod.GET && headers.has("Range")) {
+    if (!res.headers.has("content-range")) {
+      throw new Error("Missing content-range")
+    }
+  }
+
+  if (!res.ok && res.status >= 500) {
+    throw new Error(`Upstream responded with server error: ${res.status}`)
+  }
+
+  return res
+}
+
+/**
  * Hybrid cache implementation using both Cache API and edge caching
  */
 export async function cachedS3Fetch(
@@ -232,59 +406,17 @@ export async function cachedS3Fetch(
   const cache = caches.default
   const cacheRequest = new Request(cacheKey, { method: "GET" })
 
-  try {
-    // Try to get from Cache API first
-    const cachedResponse = await cache.match(cacheRequest)
+  // Try to get from Cache API first
+  const cacheResult = await handleCacheApiRequest(
+    cache,
+    cacheRequest,
+    request,
+    config,
+    cacheKey,
+  )
 
-    if (cachedResponse) {
-      // Handle conditional requests if original request is provided
-      if (request) {
-        const conditionalResponse = handleConditionalRequest(
-          request,
-          cachedResponse,
-        )
-        if (conditionalResponse) {
-          globalThis.__app_metrics.notModifiedResponses++
-          return {
-            response: conditionalResponse,
-            cacheResult: { hit: true, source: "cache", key: cacheKey },
-          }
-        }
-      }
-
-      globalThis.__app_metrics.cacheHits++
-      const contentLength = Number(
-        cachedResponse.headers.get("content-length") ?? "0",
-      )
-      if (contentLength > 0) {
-        globalThis.__app_metrics.cacheBytesServed += contentLength
-      }
-
-      if (config.debug) {
-        console.log("Cache hit from Cache API")
-      }
-
-      // Clone the response and add cache debug headers
-      const response = cachedResponse.clone()
-      if (config.debug) {
-        response.headers.set(
-          "X-Cache-Debug",
-          JSON.stringify({
-            hit: true,
-            source: "cache-api",
-            key: cacheKey,
-          }),
-        )
-      }
-
-      return {
-        response,
-        cacheResult: { hit: true, source: "cache", key: cacheKey },
-      }
-    }
-  } catch (cacheError) {
-    console.warn("Cache API error:", cacheError)
-    globalThis.__app_metrics.cacheErrors++
+  if (cacheResult) {
+    return cacheResult
   }
 
   // Cache miss - fetch from S3 with hybrid caching
@@ -293,81 +425,24 @@ export async function cachedS3Fetch(
 
   while (attempt < attempts) {
     try {
-      const signedRequest = await signer.sign(url, {
+      const res = await performFetchAttempt(
+        signer,
+        url,
         method,
-        headers: headers,
-      })
-
-      // Use fetch with cf options for edge caching as fallback
-      const fetchOptions: RequestInit & { cf?: CfProperties } = {
-        method,
-        headers: signedRequest.headers,
-        cf: {
-          // Use custom cache key
-          cacheKey: cacheKey,
-          // Cache everything for the calculated TTL
-          cacheTtl: config.ttlSeconds,
-          // Enable caching regardless of response headers
-          cacheEverything: true,
-        },
-      }
-
-      const res = await fetch(signedRequest.url, fetchOptions)
-
-      // Handle range request validation
-      if (method === HttpMethod.GET && headers.has("Range")) {
-        if (!res.headers.has("content-range")) {
-          throw new Error("Missing content-range")
-        }
-      }
+        headers,
+        config,
+        cacheKey,
+      )
 
       // Track cache metrics
       const cfCacheStatus = res.headers.get("cf-cache-status")
-      const isEdgeHit = cfCacheStatus === "HIT"
       const contentLength = Number(res.headers.get("content-length") ?? "0")
+      const isEdgeHit = updateCacheMetrics(cfCacheStatus, contentLength)
 
-      if (isEdgeHit) {
-        globalThis.__app_metrics.cacheHits++
-        if (contentLength > 0) {
-          globalThis.__app_metrics.cacheBytesServed += contentLength
-        }
-      } else {
-        globalThis.__app_metrics.cacheMisses++
-      }
+      // Store in Cache API if applicable
+      await storeInCacheApi(res, method, cache, cacheRequest, config, isEdgeHit)
 
-      // Update general metrics
-      if (contentLength > 0) {
-        globalThis.__app_metrics.bytesSent += contentLength
-      }
-
-      if (!res.ok && res.status >= 500) {
-        throw new Error(`Upstream responded with server error: ${res.status}`)
-      }
-
-      // Store in Cache API if it's a successful response and can be cached
-      if (res.ok && canCache(res, method) && !isEdgeHit) {
-        try {
-          const ttl = calculateTtl(res, config)
-          const cacheResponse = res.clone()
-
-          // Add cache headers
-          cacheResponse.headers.set("Cache-Control", `max-age=${ttl}`)
-          cacheResponse.headers.set("X-Cache-Stored", new Date().toISOString())
-
-          // Store in Cache API (fire and forget)
-          cache.put(cacheRequest, cacheResponse).catch((putError) => {
-            console.warn("Failed to store in Cache API:", putError)
-            globalThis.__app_metrics.cacheErrors++
-          })
-
-          globalThis.__app_metrics.cacheStores++
-        } catch (storeError) {
-          console.warn("Cache storage error:", storeError)
-          globalThis.__app_metrics.cacheErrors++
-        }
-      }
-
-      const cacheResult: CacheResult = {
+      const finalCacheResult: CacheResult = {
         hit: isEdgeHit,
         source: isEdgeHit ? "cache" : "s3",
         key: cacheKey,
@@ -375,17 +450,17 @@ export async function cachedS3Fetch(
       }
 
       if (config.debug) {
-        console.log("Cache result:", cacheResult)
+        console.log("Cache result:", finalCacheResult)
         console.log(`CF-Cache-Status: ${cfCacheStatus}`)
       }
 
       // Clone response and add debug headers
       const response = new Response(res.body, res)
       if (config.debug) {
-        response.headers.set("X-Cache-Debug", JSON.stringify(cacheResult))
+        response.headers.set("X-Cache-Debug", JSON.stringify(finalCacheResult))
       }
 
-      return { response, cacheResult }
+      return { response, cacheResult: finalCacheResult }
     } catch (e) {
       lastErr = e
       globalThis.__app_metrics.cacheErrors++

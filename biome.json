@@ -11,7 +11,7 @@
         "noUnusedVariables": "warn"
       },
       "complexity": {
-        "noExcessiveCognitiveComplexity": "warn"
+        "noExcessiveCognitiveComplexity": "error"
       }
     }
   },
@@ -19,10 +19,7 @@
     "indentStyle": "space"
   },
   "files": {
-    "ignore": [
-      "worker-configuration.d.ts",
-      ".wrangler/**/*.js"
-    ]
+    "ignore": ["worker-configuration.d.ts", ".wrangler/**/*.js"]
   },
   "javascript": {
     "formatter": {

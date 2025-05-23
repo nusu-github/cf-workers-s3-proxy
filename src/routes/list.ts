@@ -1,5 +1,6 @@
 import { XMLParser } from "fast-xml-parser"
 import { Hono } from "hono"
+import type { Context } from "hono"
 import { HTTPException } from "hono/http-exception"
 import type { ContentfulStatusCode } from "hono/utils/http-status"
 import { getAwsClient, getS3BaseUrl } from "../lib/aws-client.js"
@@ -21,14 +22,10 @@ import { HttpMethod } from "../types/s3.js"
 const xmlParser = new XMLParser()
 const list = new Hono<{ Bindings: Env }>()
 
-// List objects – GET /list?prefix=&continuationToken=
-list.get("/list", async (c) => {
-  // Ensure environment is validated (fail-fast behavior)
-  ensureEnvironmentValidated(c.env)
-
-  globalThis.__app_metrics.totalRequests++
-
-  // Security: URL signing enforcement for /list endpoint
+/**
+ * Validates URL signing for list endpoint
+ */
+async function validateListAccess(c: Context<{ Bindings: Env }>): Promise<void> {
   if (shouldEnforceUrlSigning(c.env, "/list")) {
     if (!c.env.URL_SIGNING_SECRET) {
       throw new HTTPException(501, {
@@ -37,12 +34,132 @@ list.get("/list", async (c) => {
     }
     await verifySignature(new URL(c.req.url), c.env.URL_SIGNING_SECRET)
   }
+}
+
+/**
+ * Maps S3 error codes to HTTP status codes
+ */
+function mapS3ErrorToHttpStatus(errorCode: string): ContentfulStatusCode {
+  switch (errorCode) {
+    case "NoSuchBucket":
+    case "NoSuchKey":
+      return 404
+    case "AccessDenied":
+    case "InvalidAccessKeyId":
+    case "SignatureDoesNotMatch":
+      return 403
+    case "InvalidBucketName":
+    case "InvalidArgument":
+      return 400
+    case "InternalError":
+    case "ServiceUnavailable":
+      return 502
+    case "SlowDown":
+    case "RequestTimeout":
+      return 503
+    default:
+      return 502
+  }
+}
+
+/**
+ * Handles S3 error responses
+ */
+function handleS3Error(parsedXml: S3ErrorResponse): never {
+  const s3Error = parsedXml.Error
+  console.error("S3 returned error:", s3Error)
+  
+  const statusCode = mapS3ErrorToHttpStatus(s3Error.Code)
+  throw new HTTPException(statusCode, {
+    message: `S3 Error: ${s3Error.Code} - ${s3Error.Message}`,
+  })
+}
+
+/**
+ * Processes S3 contents into standardized object metadata
+ */
+function processS3Contents(contents: S3ObjectMetadata | S3ObjectMetadata[] | undefined): S3ObjectMetadata[] {
+  if (!contents) return []
+
+  try {
+    if (Array.isArray(contents)) {
+      return contents
+        .map((item: S3ObjectMetadata) => {
+          if (!item?.Key) return null
+          return {
+            Key: item.Key,
+            LastModified: item.LastModified || "",
+            ETag: item.ETag || "",
+            Size: item.Size,
+            StorageClass: item.StorageClass || "STANDARD",
+          }
+        })
+        .filter((obj): obj is S3ObjectMetadata => obj !== null)
+    } 
+    
+    if (typeof contents === "object" && contents.Key?.length > 0) {
+      return [{
+        Key: contents.Key,
+        LastModified: contents.LastModified || "",
+        ETag: contents.ETag || "",
+        Size: contents.Size,
+        StorageClass: contents.StorageClass || "STANDARD",
+      }]
+    }
+    
+    return []
+  } catch (processingError) {
+    console.error("Error processing S3 contents:", processingError)
+    throw new HTTPException(502, {
+      message: "Error processing S3 response data",
+    })
+  }
+}
+
+/**
+ * Parses and validates S3 XML response
+ */
+function parseS3Response(xmlData: string): S3ListResponse {
+  if (!xmlData?.trim()) {
+    throw new HTTPException(502, { message: "Empty response from S3" })
+  }
+
+  let parsedXml: S3ListResponse | S3ErrorResponse
+  try {
+    parsedXml = xmlParser.parse(xmlData)
+  } catch (parseError) {
+    console.error("XML parsing error:", parseError)
+    throw new HTTPException(502, {
+      message: `Invalid XML response from S3: ${parseError instanceof Error ? parseError.message : "Unknown parsing error"}`,
+    })
+  }
+
+  // Handle S3 errors
+  if ("Error" in parsedXml && parsedXml.Error) {
+    handleS3Error(parsedXml)
+  }
+
+  // Validate expected structure
+  if (!("ListBucketResult" in parsedXml) || !parsedXml.ListBucketResult) {
+    console.error("Unexpected XML structure:", parsedXml)
+    throw new HTTPException(502, {
+      message: "Unexpected response structure from S3",
+    })
+  }
+
+  return parsedXml
+}
+
+// List objects – GET /list?prefix=&continuationToken=
+list.get("/list", async (c) => {
+  ensureEnvironmentValidated(c.env)
+  globalThis.__app_metrics.totalRequests++
+
+  await validateListAccess(c)
 
   // Security: Validate and sanitize prefix parameter
   const rawPrefix = c.req.query("prefix") ?? ""
   const prefix = validateAndSanitizePrefix(rawPrefix, c.env)
-
-  // Get continuation token for pagination
   const continuationToken = c.req.query("continuationToken")
 
   const signer = getAwsClient(c.env)
@@ -65,134 +182,28 @@ list.get("/list", async (c) => {
 
   // Validate content type
   const contentType = resp.headers.get("content-type") || ""
-  if (
-    !contentType.includes("xml") &&
-    !contentType.includes("application/xml")
-  ) {
+  if (!contentType.includes("xml") && !contentType.includes("application/xml")) {
     console.warn(`Unexpected content-type for S3 list response: ${contentType}`)
   }
 
   const xmlData = await resp.text()
-
-  // Validate that we have some content
-  if (!xmlData || xmlData.trim().length === 0) {
+  const parsedXml = parseS3Response(xmlData)
+  
+  if (!parsedXml.ListBucketResult) {
     throw new HTTPException(502, {
-      message: "Empty response from S3",
+      message: "Invalid response structure from S3",
     })
   }
-
-  let parsedXml: S3ListResponse | S3ErrorResponse
-
-  try {
-    // Parse XML with error handling
-    parsedXml = xmlParser.parse(xmlData)
-  } catch (parseError) {
-    console.error("XML parsing error:", parseError)
-    throw new HTTPException(502, {
-      message: `Invalid XML response from S3: ${parseError instanceof Error ? parseError.message : "Unknown parsing error"}`,
-    })
-  }
-
-  // Check if the response is an S3 error
-  if ("Error" in parsedXml && parsedXml.Error) {
-    const s3Error = parsedXml.Error
-    console.error("S3 returned error:", s3Error)
-
-    // Map common S3 error codes to appropriate HTTP status codes
-    let statusCode: ContentfulStatusCode
-    switch (s3Error.Code) {
-      case "NoSuchBucket":
-      case "NoSuchKey":
-        statusCode = 404
-        break
-      case "AccessDenied":
-      case "InvalidAccessKeyId":
-      case "SignatureDoesNotMatch":
-        statusCode = 403
-        break
-      case "InvalidBucketName":
-      case "InvalidArgument":
-        statusCode = 400
-        break
-      case "InternalError":
-      case "ServiceUnavailable":
-        statusCode = 502
-        break
-      case "SlowDown":
-      case "RequestTimeout":
-        statusCode = 503
-        break
-      default:
-        statusCode = 502
-    }
-
-    throw new HTTPException(statusCode, {
-      message: `S3 Error: ${s3Error.Code} - ${s3Error.Message}`,
-    })
-  }
-
-  // Validate expected structure
-  if (!("ListBucketResult" in parsedXml) || !parsedXml.ListBucketResult) {
-    console.error("Unexpected XML structure:", parsedXml)
-    throw new HTTPException(502, {
-      message: "Unexpected response structure from S3",
-    })
-  }
-
+  
   const listResult = parsedXml.ListBucketResult
-  let objects: S3ObjectMetadata[] = []
-  const contents = listResult.Contents
-
-  if (contents) {
-    try {
-      if (Array.isArray(contents)) {
-        objects = contents
-          .map((item: S3ObjectMetadata) => {
-            // Validate required fields
-            if (!item?.Key) {
-              return null
-            }
-
-            return {
-              Key: item.Key,
-              LastModified: item.LastModified || "",
-              ETag: item.ETag || "",
-              Size: item.Size,
-              StorageClass: item.StorageClass || "STANDARD",
-            }
-          })
-          .filter((obj): obj is S3ObjectMetadata => obj !== null)
-      } else if (typeof contents === "object" && contents.Key) {
-        // Handle case where there's only one item (contents is an object)
-        if (contents.Key.length > 0) {
-          objects = [
-            {
-              Key: contents.Key,
-              LastModified: contents.LastModified || "",
-              ETag: contents.ETag || "",
-              Size: contents.Size,
-              StorageClass: contents.StorageClass || "STANDARD",
-            },
-          ]
-        }
-      }
-    } catch (processingError) {
-      console.error("Error processing S3 contents:", processingError)
-      throw new HTTPException(502, {
-        message: "Error processing S3 response data",
-      })
-    }
-  }
+  const objects = processS3Contents(listResult.Contents)
 
   // Construct enhanced response with pagination and metadata
   const response: EnhancedListResponse = {
     objects: objects,
     isTruncated: Boolean(listResult.IsTruncated),
     prefix: prefix,
-    keyCount:
-      typeof listResult.KeyCount === "number"
-        ? listResult.KeyCount
-        : objects.length,
+    keyCount: typeof listResult.KeyCount === "number" ? listResult.KeyCount : objects.length,
   }
 
   // Include next continuation token if pagination is available
@@ -202,9 +213,7 @@ list.get("/list", async (c) => {
 
   // Add debug logging if needed
   if (c.env.CACHE_DEBUG) {
-    console.log(
-      `S3 list response processed: ${objects.length} objects found, isTruncated: ${response.isTruncated}`,
-    )
+    console.log(`S3 list response processed: ${objects.length} objects found, isTruncated: ${response.isTruncated}`)
     if (response.nextContinuationToken) {
       console.log(`Next continuation token: ${response.nextContinuationToken}`)
     }

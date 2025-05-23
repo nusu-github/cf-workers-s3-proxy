@@ -78,6 +78,118 @@ export const verifySignature = async (
 }
 
 /**
+ * Validates prefix length against configured limits
+ */
+function validatePrefixLength(prefix: string, maxLength: number): void {
+  if (prefix.length > maxLength) {
+    throw new HTTPException(400, {
+      message: `Prefix too long. Maximum length is ${maxLength} characters.`,
+    })
+  }
+}
+
+/**
+ * Detects and prevents path traversal attempts
+ */
+function validateNoPathTraversal(prefix: string): void {
+  const traversalPatterns = [
+    "../",
+    "..\\",
+    "..",
+    "%2e%2e",
+    "%2E%2E", // URL encoded ..
+    "%2e%2e%2f",
+    "%2E%2E%2F", // URL encoded ../
+    "%2e%2e%5c",
+    "%2E%2E%5C", // URL encoded ..\
+  ]
+
+  const lowerPrefix = prefix.toLowerCase()
+  for (const pattern of traversalPatterns) {
+    if (lowerPrefix.includes(pattern)) {
+      throw new HTTPException(400, {
+        message: "Path traversal detected in prefix parameter.",
+      })
+    }
+  }
+
+  // Additional path traversal checks
+  if (
+    prefix.startsWith("../") ||
+    prefix.endsWith("/..") ||
+    prefix.includes("/../") ||
+    prefix === ".."
+  ) {
+    throw new HTTPException(400, {
+      message: "Path traversal detected in prefix parameter.",
+    })
+  }
+}
+
+/**
+ * Removes control characters and validates allowed characters
+ */
+function sanitizeAndValidateCharacters(prefix: string): string {
+  // Remove control characters (0x00-0x1F, 0x7F) and other problematic characters
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: Unicode ranges needed for security validation
+  const sanitized = prefix.replace(/[\u0000-\u001F\u007F\u0080-\u009F]/g, "")
+
+  // Validate allowed characters for S3 object keys
+  // S3 allows: letters, numbers, and these special characters: ! - _ . * ' ( ) /
+  // A more restrictive set of characters is enforced for security.
+  const allowedPattern = /^[a-zA-Z0-9\-_.\/'()*!]*$/
+  if (!allowedPattern.test(sanitized)) {
+    throw new HTTPException(400, {
+      message:
+        "Prefix contains invalid characters. Only letters, numbers, and these special characters are allowed: - _ . / ' ( ) * !",
+    })
+  }
+
+  return sanitized
+}
+
+/**
+ * Normalizes path separators and removes leading slashes
+ */
+function normalizePath(prefix: string): string {
+  // Normalize path separators and remove consecutive slashes
+  let normalized = prefix.replace(/\\+/g, "/").replace(/\/+/g, "/")
+
+  // Remove leading slash if present (S3 object keys shouldn't start with /)
+  if (normalized.startsWith("/")) {
+    normalized = normalized.substring(1)
+  }
+
+  return normalized
+}
+
+/**
+ * Validates prefix depth and segment length constraints
+ */
+function validatePrefixStructure(prefix: string, maxDepth: number): void {
+  if (prefix === "") return
+
+  // Limit depth to prevent overly complex prefix structures
+  const depth = prefix.split("/").length
+  if (depth > maxDepth) {
+    throw new HTTPException(400, {
+      message: `Prefix depth exceeds maximum allowed (${maxDepth} levels).`,
+    })
+  }
+
+  // Additional security: reject prefixes that are suspiciously long relative to depth
+  if (depth > 0) {
+    const avgSegmentLength = prefix.length / depth
+    if (avgSegmentLength > 128) {
+      // Configurable threshold
+      throw new HTTPException(400, {
+        message: "Prefix segments are excessively long.",
+      })
+    }
+  }
+}
+
+/**
  * Validates and sanitizes S3 object key prefixes to prevent security issues
  * and ensure compliance with S3 naming guidelines.
  */
@@ -92,89 +204,20 @@ export function validateAndSanitizePrefix(prefix: string, env: Env): string {
   const maxLength = int(env.PREFIX_MAX_LENGTH ?? "512", "PREFIX_MAX_LENGTH")
   const maxDepth = int(env.PREFIX_MAX_DEPTH ?? "10", "PREFIX_MAX_DEPTH")
 
-  // Reject if too long (S3 limit is 1024 chars, but a more restrictive limit is applied for prefixes)
-  if (sanitized.length > maxLength) {
-    throw new HTTPException(400, {
-      message: `Prefix too long. Maximum length is ${maxLength} characters.`,
-    })
-  }
+  // Validate prefix length
+  validatePrefixLength(sanitized, maxLength)
 
-  // Prevent path traversal attempts - comprehensive checks
-  const traversalPatterns = [
-    "../",
-    "..\\",
-    "..",
-    "%2e%2e",
-    "%2E%2E", // URL encoded ..
-    "%2e%2e%2f",
-    "%2E%2E%2F", // URL encoded ../
-    "%2e%2e%5c",
-    "%2E%2E%5C", // URL encoded ..\
-  ]
+  // Prevent path traversal attempts
+  validateNoPathTraversal(sanitized)
 
-  const lowerSanitized = sanitized.toLowerCase()
-  for (const pattern of traversalPatterns) {
-    if (lowerSanitized.includes(pattern)) {
-      throw new HTTPException(400, {
-        message: "Path traversal detected in prefix parameter.",
-      })
-    }
-  }
+  // Sanitize characters and validate allowed character set
+  sanitized = sanitizeAndValidateCharacters(sanitized)
 
-  // Additional path traversal checks
-  if (
-    sanitized.startsWith("../") ||
-    sanitized.endsWith("/..") ||
-    sanitized.includes("/../") ||
-    sanitized === ".."
-  ) {
-    throw new HTTPException(400, {
-      message: "Path traversal detected in prefix parameter.",
-    })
-  }
+  // Normalize path structure
+  sanitized = normalizePath(sanitized)
 
-  // Remove control characters (0x00-0x1F, 0x7F) and other problematic characters
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: Unicode ranges needed for security validation
-  sanitized = sanitized.replace(/[\u0000-\u001F\u007F\u0080-\u009F]/g, "")
-
-  // Validate allowed characters for S3 object keys
-  // S3 allows: letters, numbers, and these special characters: ! - _ . * ' ( ) /
-  // A more restrictive set of characters is enforced for security.
-  const allowedPattern = /^[a-zA-Z0-9\-_.\/'()*!]*$/
-  if (!allowedPattern.test(sanitized)) {
-    throw new HTTPException(400, {
-      message:
-        "Prefix contains invalid characters. Only letters, numbers, and these special characters are allowed: - _ . / ' ( ) * !",
-    })
-  }
-
-  // Normalize path separators and remove consecutive slashes
-  sanitized = sanitized.replace(/\\+/g, "/").replace(/\/+/g, "/")
-
-  // Remove leading slash if present (S3 object keys shouldn't start with /)
-  if (sanitized.startsWith("/")) {
-    sanitized = sanitized.substring(1)
-  }
-
-  // Limit depth to prevent overly complex prefix structures that could be used for abuse
-  const depth = sanitized === "" ? 0 : sanitized.split("/").length
-  if (depth > maxDepth) {
-    throw new HTTPException(400, {
-      message: `Prefix depth exceeds maximum allowed (${maxDepth} levels).`,
-    })
-  }
-
-  // Additional security: reject prefixes that are suspiciously long relative to depth
-  // This helps prevent abuse where someone tries to create very long prefixes
-  if (sanitized.length > 0 && depth > 0) {
-    const avgSegmentLength = sanitized.length / depth
-    if (avgSegmentLength > 128) {
-      // Configurable threshold
-      throw new HTTPException(400, {
-        message: "Prefix segments are excessively long.",
-      })
-    }
-  }
+  // Validate prefix structure constraints
+  validatePrefixStructure(sanitized, maxDepth)
 
   return sanitized
 }

@@ -64,6 +64,76 @@ export async function generatePresignedUrl(
   return signedRequest.url
 }
 
+/**
+ * Validates range request response
+ */
+function validateRangeResponse(
+  method: HttpMethod,
+  headers: Headers,
+  response: Response,
+): void {
+  if (method === HttpMethod.GET && headers.has("Range")) {
+    if (!response.headers.has("content-range")) {
+      throw new Error("Missing content-range")
+    }
+  }
+}
+
+/**
+ * Updates metrics based on response content length
+ */
+function updateResponseMetrics(response: Response): void {
+  const contentLength = Number(response.headers.get("content-length") ?? "0")
+  if (contentLength > 0) {
+    globalThis.__app_metrics.bytesSent += contentLength
+  }
+}
+
+/**
+ * Handles server error responses
+ */
+function handleServerError(response: Response): Response {
+  if (!response.ok) {
+    if (response.status >= 500) {
+      throw new Error(
+        `Upstream responded with server error: ${response.status}`,
+      )
+    }
+    updateResponseMetrics(response)
+    return response
+  }
+  return response
+}
+
+/**
+ * Performs a single S3 fetch attempt
+ */
+async function performS3FetchAttempt(
+  signer: AwsClient,
+  url: string,
+  method: HttpMethod,
+  headers: Headers,
+): Promise<Response> {
+  const signedRequest = await signer.sign(url, {
+    method,
+    headers: headers,
+  })
+
+  const response = await fetch(signedRequest.clone())
+
+  validateRangeResponse(method, headers, response)
+
+  const handledResponse = handleServerError(response)
+
+  // Update metrics for successful responses
+  if (handledResponse.ok) {
+    updateResponseMetrics(handledResponse)
+    return new Response(handledResponse.body, handledResponse)
+  }
+
+  return handledResponse
+}
+
 /** Build signed request and fetch with retry */
 export async function s3Fetch(
   signer: AwsClient,
@@ -77,28 +147,7 @@ export async function s3Fetch(
 
   while (attempt < attempts) {
     try {
-      const signedRequest = await signer.sign(url, {
-        method,
-        headers: headers,
-      })
-      const res = await fetch(signedRequest.clone())
-      if (method === HttpMethod.GET && headers.has("Range")) {
-        if (!res.headers.has("content-range")) {
-          throw new Error("Missing content-range")
-        }
-      }
-      if (!res.ok) {
-        if (res.status >= 500) {
-          throw new Error(`Upstream responded with server error: ${res.status}`)
-        }
-        const contentLength = Number(res.headers.get("content-length") ?? "0")
-        if (contentLength > 0)
-          globalThis.__app_metrics.bytesSent += contentLength
-        return res
-      }
-      const contentLength = Number(res.headers.get("content-length") ?? "0")
-      if (contentLength > 0) globalThis.__app_metrics.bytesSent += contentLength
-      return new Response(res.body, res)
+      return await performS3FetchAttempt(signer, url, method, headers)
     } catch (e) {
       lastErr = e
       const backoff = 200 * 2 ** attempt + Math.random() * 100
@@ -106,5 +155,6 @@ export async function s3Fetch(
       attempt++
     }
   }
+
   throw new Error(`Failed after ${attempts} attempts: ${String(lastErr)}`)
 }
