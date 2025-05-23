@@ -6,13 +6,11 @@ This document outlines the security features and considerations for the Cloudfla
 
 ### Overview
 
-The proxy supports URL signature validation for secure access control. When `URL_SIGNING_SECRET` is configured, all
-requests must include valid signatures to access protected resources.
+The proxy supports URL signature validation for secure access control. When `URL_SIGNING_SECRET` is configured, all requests must include valid signatures to access protected resources.
 
 ### AWS S3 Signature Version 4 Compliance
 
-The signature validation implementation follows AWS S3 Signature Version 4 standards for maximum compatibility and
-security:
+The signature validation implementation follows AWS S3 Signature Version 4 standards for maximum compatibility and security:
 
 #### Canonical Query String Construction
 
@@ -60,8 +58,7 @@ The implementation returns appropriate HTTP status codes for different security 
 - **403 Forbidden**: Invalid or missing signatures, expired URLs, malformed signature format
 - **401 Unauthorized**: Reserved for other authentication methods (not signature validation)
 
-This follows security best practices where signature validation failures are authorization issues (403), not
-authentication issues (401).
+This follows security best practices where signature validation failures are authorization issues (403), not authentication issues (401).
 
 ### Cache Security
 
@@ -172,4 +169,4 @@ node src/generate_signed_url.js
 1. High rate of 403 errors (potential attack)
 2. Unusual geographic distribution of signature failures
 3. Cache purge requests from unauthorized sources
-4. Environment validation failures at startup 
+4. Environment validation failures at startup

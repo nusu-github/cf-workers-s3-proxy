@@ -3,8 +3,7 @@
 ## Overview
 
 The S3 proxy now features a significantly enhanced cache management system that provides better performance, more
-control, and comprehensive cache operations. This system uses a **hybrid caching approach** combining Cloudflare's edge
-caching with the Cache API for optimal performance.
+control, and comprehensive cache operations. This system uses a **hybrid caching approach** combining Cloudflare's edge caching with the Cache API for optimal performance.
 
 ## Key Improvements
 
@@ -343,5 +342,4 @@ Based on typical usage patterns:
 - **CPU**: Slight increase for cache operations
 - **Network**: Reduced bandwidth to origin storage
 
-This enhanced cache management system provides production-ready performance optimization while maintaining the
-simplicity and reliability of the original S3 proxy. 
+This enhanced cache management system provides production-ready performance optimization while maintaining the simplicity and reliability of the original S3 proxy.

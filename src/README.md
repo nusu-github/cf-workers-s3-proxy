@@ -312,7 +312,7 @@ app.use("/:filename{.*}/uploads", setupBodyLimit(1024));
 
 ```typescript
 // Context-aware error responses
-return c.json({ 
+return c.json({
     error: message,
     requestId,
     timestamp: new Date().toISOString(),

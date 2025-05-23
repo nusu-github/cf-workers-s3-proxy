@@ -2,9 +2,7 @@
 
 ![Cloudflare Workers](https://img.shields.io/badge/cloudflare%20workers-F38020?style=for-the-badge\&logo=cloudflare) ![Hono](https://img.shields.io/badge/hono-E36002?style=for-the-badge\&logo=hono) ![MIT License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
 
-A lightweight, cache‑friendly proxy that lets you serve objects from any S3‑compatible storage (Backblaze B2, MinIO,
-DigitalOcean Spaces, etc.) through the Cloudflare edge. Perfect for static asset hosting, private downloads, or as a
-drop‑in CDN for existing buckets.
+A lightweight, cache‑friendly proxy that lets you serve objects from any S3‑compatible storage (Backblaze B2, MinIO,DigitalOcean Spaces, etc.) through the Cloudflare edge. Perfect for static asset hosting, private downloads, or as adrop‑in CDN for existing buckets.
 
 ## Table of Contents
 
@@ -128,21 +126,24 @@ GET /images/a.jpg?inline
 
 ### `PUT /<filename>`
 
-Uploads a file. The worker streams the request body directly to S3.
-Relevant headers like `Content-Type`, `Content-MD5`, `Content-Length`, `Content-Encoding`, `Cache-Control`, `x-amz-meta-*`, `x-amz-checksum-*`, and S3 server-side encryption headers are forwarded to S3.
+Uploads a file. The worker streams the request body directly to S3.Relevant headers like `Content-Type`, `Content-MD5`, `Content-Length`, `Content-Encoding`, `Cache-Control`,`x-amz-meta-*`, `x-amz-checksum-*`, and S3 server-side encryption headers are forwarded to S3.
 If URL signing is enabled, PUT requests must be signed.
 
 ### `POST /presigned-upload`
 
 Generates a presigned S3 URL for PUT uploads.
 Request body:
+
 ```json
 {
   "key": "path/to/your/object.txt",
-  "expiresIn": 3600, // Optional: expiration in seconds (default 3600, max 7 days)
-  "conditions": { // Optional: conditions for the upload
+  "expiresIn": 3600,
+  // Optional: expiration in seconds (default 3600, max 7 days)
+  "conditions": {
+    // Optional: conditions for the upload
     "contentType": "text/plain",
-    "contentLength": 1024, // in bytes
+    "contentLength": 1024,
+    // in bytes
     "contentMd5": "base64-md5-hash",
     "metadata": {
       "custom-key": "custom-value"
@@ -150,7 +151,9 @@ Request body:
   }
 }
 ```
+
 Response:
+
 ```json
 {
   "presignedUrl": "...",
@@ -158,29 +161,37 @@ Response:
   "expiresIn": 3600,
   "expiresAt": "...",
   "method": "PUT",
-  "requiredHeaders": { ... }
+  "requiredHeaders": {
+    ...
+  }
 }
 ```
 
 ### `POST /<filename>/uploads`
 
-Initiates a multipart upload. Forward `Content-Type` and `x-amz-meta-*` headers as needed. The worker proxies the request to S3 and returns the S3 XML response containing the `UploadId`. If URL signing is enabled, this endpoint can be protected by URL signing.
+Initiates a multipart upload. Forward `Content-Type` and`x-amz-meta-*` headers as needed. The worker proxies the request to S3 and returns the S3 XML response containing the`UploadId`. If URL signing is enabled, this endpoint can be protected by URL signing.
 
 ### `DELETE /<filename>`
 
-Deletes a file. An optional `versionId` query parameter can be included. Returns a 200 OK with a JSON body indicating success. If URL signing is enabled, DELETE requests must be signed.
+Deletes a file. An optional`versionId` query parameter can be included. Returns a 200 OK with a JSON body indicating success. If URL signing is enabled, DELETE requests must be signed.
 
 ### `POST /delete`
 
 Batch deletes files.
 Request body:
+
 ```json
 {
-  "keys": ["path/to/object1.txt", "path/to/object2.jpg"],
-  "quiet": false // Optional: if true, S3 returns success even if some keys fail (default false)
+  "keys": [
+    "path/to/object1.txt",
+    "path/to/object2.jpg"
+  ],
+  "quiet": false
+  // Optional: if true, S3 returns success even if some keys fail (default false)
 }
 ```
-A maximum of 1000 keys can be specified. The S3 XML response detailing the result for each key is returned (unless `quiet` is `true`). If URL signing is enabled, this endpoint can be protected.
+
+A maximum of 1000 keys can be specified. The S3 XML response detailing the result for each key is returned (unless`quiet` is `true`). If URL signing is enabled, this endpoint can be protected.
 
 ### `GET /__health`
 
@@ -216,10 +227,11 @@ Returns detailed cache statistics including hit rates, configuration, and perfor
 ### `GET /__cache/health`
 
 Returns the health status of the cache system.
+
 ```json
 {
   "status": "healthy",
-  "message": "Cache is functioning normally",
+  "message": "Cache is functioning normally"
   // ... more details ...
 }
 ```
@@ -229,6 +241,7 @@ Returns the health status of the cache system.
 Authenticated endpoint for cache invalidation. Requires `Authorization: Bearer <CACHE_PURGE_SECRET>` header.
 
 Purge by specific keys:
+
 ```bash
 curl -X POST /__cache/purge \
   -H "Authorization: Bearer your-secure-secret" \
@@ -239,6 +252,7 @@ curl -X POST /__cache/purge \
 ```
 
 Purge by pattern (future support):
+
 ```bash
 curl -X POST /__cache/purge \
   -H "Authorization: Bearer your-secure-secret" \
@@ -251,6 +265,7 @@ curl -X POST /__cache/purge \
 ### `POST /__cache/warm`
 
 Authenticated endpoint for proactive cache population. Requires `Authorization: Bearer <CACHE_PURGE_SECRET>` header.
+
 ```bash
 curl -X POST /__cache/warm \
   -H "Authorization: Bearer your-secure-secret" \
