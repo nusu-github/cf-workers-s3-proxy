@@ -7,23 +7,92 @@ import { requestId } from "hono/request-id"
 import { secureHeaders } from "hono/secure-headers"
 import { timing } from "hono/timing"
 
+// ───────────────────────────────────────── Constants  ─────────────────────────────────────────
 /**
- * Setup secure headers middleware
+ * Default body size limit in bytes (100MB)
+ */
+const DEFAULT_MAX_BODY_SIZE = 100 * 1024 * 1024
+
+/**
+ * Cache control max age for preflight requests (24 hours)
+ */
+const CORS_MAX_AGE_SECONDS = 86400
+
+/**
+ * Security header configuration constants
+ */
+const SECURITY_CONFIG = {
+  X_CONTENT_TYPE_OPTIONS: "nosniff",
+  ORIGIN_AGENT_CLUSTER: "?1",
+  REFERRER_POLICY: "strict-origin-when-cross-origin",
+} as const
+
+/**
+ * ETag configuration for optimal caching
+ */
+const ETAG_RETAINED_HEADERS = [
+  "content-encoding",
+  "content-type",
+  "cache-control",
+] as const
+
+/**
+ * CORS allowed methods for S3 proxy operations
+ */
+const CORS_ALLOWED_METHODS = [
+  "GET",
+  "HEAD",
+  "POST",
+  "PUT",
+  "DELETE",
+  "OPTIONS",
+] as const
+
+/**
+ * CORS headers for request/response handling
+ */
+const CORS_HEADERS = {
+  ALLOW: [
+    "Content-Type",
+    "Authorization",
+    "Range",
+    "If-None-Match",
+    "If-Modified-Since",
+    "Content-MD5",
+    "Content-Length",
+    "Cache-Control",
+  ] as const,
+  EXPOSE: [
+    "Content-Range",
+    "Accept-Ranges",
+    "ETag",
+    "Last-Modified",
+    "X-Cache-Debug",
+    "Server-Timing",
+  ] as const,
+}
+
+// ───────────────────────────────────────── Middleware Functions  ─────────────────────────────────────────
+
+/**
+ * Setup secure headers middleware with S3 proxy optimized configuration
+ * Provides essential security headers while allowing CDN embedding
  */
 export function setupSecureHeaders() {
   return secureHeaders({
-    xContentTypeOptions: "nosniff",
-    crossOriginEmbedderPolicy: false,
-    crossOriginOpenerPolicy: false,
-    crossOriginResourcePolicy: "cross-origin",
-    originAgentCluster: "?1", // Allow embedding for CDN use case
-    referrerPolicy: "strict-origin-when-cross-origin",
-    xPermittedCrossDomainPolicies: false,
+    xContentTypeOptions: SECURITY_CONFIG.X_CONTENT_TYPE_OPTIONS,
+    crossOriginEmbedderPolicy: false, // Allow embedding for CDN use
+    crossOriginOpenerPolicy: false, // Allow popup windows
+    crossOriginResourcePolicy: "cross-origin", // Allow cross-origin resource sharing
+    originAgentCluster: SECURITY_CONFIG.ORIGIN_AGENT_CLUSTER,
+    referrerPolicy: SECURITY_CONFIG.REFERRER_POLICY,
+    xPermittedCrossDomainPolicies: false, // Disable Flash policy files
   })
 }
 
 /**
- * Setup request ID middleware
+ * Setup request ID middleware for request tracking and debugging
+ * Generates unique IDs for each request to enable log correlation
  */
 export function setupRequestId() {
   return requestId()
@@ -31,134 +100,142 @@ export function setupRequestId() {
 
 /**
  * Setup timing middleware for performance monitoring
+ * Adds Server-Timing headers to track request processing time
  */
 export function setupTiming() {
   return timing()
 }
 
 /**
- * Setup ETag middleware for better caching
+ * Setup ETag middleware for efficient caching
+ * Uses weak ETags with retained headers for optimal cache performance
  */
 export function setupETag() {
   return etag({
-    retainedHeaders: ["content-encoding", "content-type", "cache-control"],
+    retainedHeaders: [...ETAG_RETAINED_HEADERS],
     weak: true, // Use weak ETags for better performance
   })
 }
 
 /**
- * Setup body limit middleware for upload endpoints
+ * Setup body limit middleware with configurable size limits
+ * Prevents memory exhaustion from oversized request bodies
+ *
+ * @param maxSize - Maximum allowed body size in bytes (default: 100MB)
+ * @returns Configured body limit middleware
  */
-export function setupBodyLimit(maxSize = 100 * 1024 * 1024) {
-  // 100MB default
+export function setupBodyLimit(maxSize = DEFAULT_MAX_BODY_SIZE) {
   return bodyLimit({
     maxSize,
     onError: (c) => {
-      return c.json({ error: "Request body too large", maxSize }, 413)
+      console.warn(`Request body exceeded limit: ${maxSize} bytes`, {
+        path: c.req.path,
+        method: c.req.method,
+        contentLength: c.req.header("content-length"),
+      })
+
+      return c.json(
+        {
+          error: "Request body too large",
+          maxSize,
+          unit: "bytes",
+        },
+        413,
+      )
     },
   })
+}
+
+/**
+ * Parse and validate allowed origins from environment variable
+ * Handles comma-separated origin lists and wildcard configuration
+ *
+ * @param originsConfig - Comma-separated string of allowed origins
+ * @returns Array of trimmed origin strings
+ */
+function parseAllowedOrigins(originsConfig: string): string[] {
+  return originsConfig
+    .split(",")
+    .map((origin: string) => origin.trim())
+    .filter((origin: string) => origin.length > 0)
+}
+
+/**
+ * Determine if origin should be allowed based on configuration
+ * Supports wildcard (*) and explicit origin matching
+ *
+ * @param origin - Request origin header value
+ * @param allowedOrigins - Array of allowed origin patterns
+ * @returns Allowed origin string or undefined if rejected
+ */
+function validateOrigin(
+  origin: string,
+  allowedOrigins: string[],
+): string | undefined {
+  // Allow wildcard configuration
+  if (allowedOrigins.includes("*")) {
+    return "*"
+  }
+
+  // Check exact origin match
+  if (allowedOrigins.includes(origin)) {
+    return origin
+  }
+
+  return undefined // Reject origin
 }
 
 /**
  * Setup CORS middleware with environment-based configuration
+ * Supports flexible origin configuration via environment variables
  */
 export function setupCors() {
   return cors({
     origin: (origin: string | undefined, c: Context<{ Bindings: Env }>) => {
-      if (!origin) return "*" // Allow requests without origin header
+      // Allow requests without origin header (e.g., server-to-server)
+      if (!origin) return "*"
 
-      const allowedOrigins = (c.env.CORS_ALLOW_ORIGINS ?? "*")
-        .toString()
-        .split(",")
-        .map((s: string) => s.trim())
+      const originsConfig = c.env.CORS_ALLOW_ORIGINS ?? "*"
+      const allowedOrigins = parseAllowedOrigins(originsConfig.toString())
 
-      // If "*" is in the list, allow all origins
-      if (allowedOrigins.includes("*")) {
-        return "*"
-      }
-
-      // Check if origin is in allowed list
-      if (allowedOrigins.includes(origin)) {
-        return origin
-      }
-
-      return undefined // Reject origin
+      return validateOrigin(origin, allowedOrigins)
     },
-    allowMethods: ["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowHeaders: [
-      "Content-Type",
-      "Authorization",
-      "Range",
-      "If-None-Match",
-      "If-Modified-Since",
-      "Content-MD5",
-      "Content-Length",
-      "Cache-Control",
-    ],
-    exposeHeaders: [
-      "Content-Range",
-      "Accept-Ranges",
-      "ETag",
-      "Last-Modified",
-      "X-Cache-Debug",
-      "Server-Timing",
-    ],
-    maxAge: 86400, // 24 hours
-    credentials: false, // No cookies needed for S3 proxy
+    allowMethods: [...CORS_ALLOWED_METHODS],
+    allowHeaders: [...CORS_HEADERS.ALLOW],
+    exposeHeaders: [...CORS_HEADERS.EXPOSE],
+    maxAge: CORS_MAX_AGE_SECONDS,
+    credentials: false, // No cookies needed for S3 proxy operations
   })
 }
 
 /**
- * Setup logging middleware with enhanced formatting
+ * Setup enhanced logging middleware with structured output
+ * Adds timestamps and improves log formatting for better debugging
  */
 export function setupLogger() {
   return logger((str, ...rest) => {
-    // Enhanced logging with timestamp and request ID
     const timestamp = new Date().toISOString()
     console.log(`[${timestamp}] ${str}`, ...rest)
   })
 }
 
 /**
- * Enhanced metrics and context tracking middleware
- */
-export function metricsMiddleware() {
-  return async (c: Context, next: Next) => {
-    const startTime = Date.now()
-
-    // Initialize request context
-    c.set("startTime", startTime)
-    c.set("requestId", c.get("requestId") || crypto.randomUUID())
-
-    // Increment total requests
-    globalThis.__app_metrics.totalRequests++
-
-    try {
-      await next()
-
-      // Track request completion time
-      const endTime = Date.now()
-      const duration = endTime - startTime
-      c.set("requestDuration", duration)
-
-      // Add performance timing header
-      c.header("Server-Timing", `total;dur=${duration}`)
-    } catch (error) {
-      // Track errors
-      globalThis.__app_metrics.totalErrors++
-      throw error
-    }
-  }
-}
-
-/**
- * Environment validation middleware
+ * Environment validation middleware with lazy loading
+ * Validates required environment variables before processing requests
+ * Uses dynamic import to avoid circular dependencies
  */
 export function environmentValidationMiddleware() {
   return async (c: Context<{ Bindings: Env }>, next: Next) => {
-    // Import and run validation lazily
-    const { ensureEnvironmentValidated } = await import("../lib/validation.js")
-    ensureEnvironmentValidated(c.env)
-    await next()
+    try {
+      // Lazy import to avoid potential circular dependencies
+      const { ensureEnvironmentValidated } = await import(
+        "../lib/validation.js"
+      )
+      ensureEnvironmentValidated(c.env)
+      await next()
+    } catch (error) {
+      console.error("Environment validation failed:", error)
+      throw error // Re-throw to trigger error handler
+    }
   }
 }

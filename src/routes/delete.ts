@@ -25,8 +25,6 @@ deleteRoute.delete("/:filename{.*}", filenameValidator, async (c) => {
   // Ensure environment is validated
   ensureEnvironmentValidated(c.env)
 
-  globalThis.__app_metrics.totalRequests++
-
   const validatedData = c.req.valid("param") as { filename: string }
   const filename = validatedData.filename
 
@@ -65,7 +63,6 @@ deleteRoute.delete("/:filename{.*}", filenameValidator, async (c) => {
     // S3 returns 204 No Content for successful deletions
     // It also returns 204 if the object doesn't exist (idempotent)
     if (response.status === 204) {
-      globalThis.__app_metrics.totalDeletes++ // Increment delete counter
       return c.json({
         success: true,
         message: `File '${filename}' deleted successfully`,
@@ -110,8 +107,6 @@ deleteRoute.post(
   async (c) => {
     // Ensure environment is validated
     ensureEnvironmentValidated(c.env)
-
-    globalThis.__app_metrics.totalRequests++
 
     // Security: URL signing enforcement for batch delete
     if (shouldEnforceUrlSigning(c.env, "/delete")) {
@@ -194,7 +189,6 @@ ${xmlObjects}
       }
 
       // Return success response for quiet mode
-      globalThis.__app_metrics.totalDeletes += keys.length // Increment delete counter for batch
       return c.json({
         success: true,
         message: `Batch delete initiated for ${keys.length} objects`,

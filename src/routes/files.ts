@@ -4,7 +4,7 @@ import { HTTPException } from "hono/http-exception"
 import { getAwsClient, getS3BaseUrl } from "../lib/aws-client.js"
 import { cachedS3Fetch, getCacheConfig } from "../lib/cache.js"
 import { shouldEnforceUrlSigning, verifySignature } from "../lib/security.js"
-import { int, sanitizeDownloadFilename } from "../lib/utils.js"
+import { parseInteger, sanitizeDownloadFilename } from "../lib/utils.js"
 import { ensureEnvironmentValidated } from "../lib/validation.js"
 
 import { HttpMethod } from "../types/s3.js"
@@ -111,10 +111,10 @@ function enhanceResponse(
   version: string | undefined,
 ): Response {
   // Check if we need to add any headers
-  const needsDebugHeader = config.debug && cacheResult
-  const needsVersionHeader = true // Always add version header
+  const shouldIncludeDebugHeader = config.debug && cacheResult
+  const shouldIncludeVersionHeader = true // Always add version header
 
-  if (needsDebugHeader || needsVersionHeader) {
+  if (shouldIncludeDebugHeader || shouldIncludeVersionHeader) {
     // Create new response with mutable headers to avoid immutable header errors
     const enhancedResponse = new Response(response.body, {
       status: response.status,
@@ -123,10 +123,10 @@ function enhanceResponse(
     })
 
     // Add headers to the new mutable response
-    if (needsDebugHeader) {
+    if (shouldIncludeDebugHeader) {
       enhancedResponse.headers.set("X-Cache-Debug", JSON.stringify(cacheResult))
     }
-    if (needsVersionHeader) {
+    if (shouldIncludeVersionHeader) {
       enhancedResponse.headers.set("X-Proxy-Version", version || "dev")
     }
 
@@ -140,8 +140,6 @@ function enhanceResponse(
 files.get("/:filename{.*}", filenameValidator, async (c) => {
   // Ensure environment is validated (fail-fast behavior)
   ensureEnvironmentValidated(c.env)
-
-  globalThis.__app_metrics.totalRequests++
 
   const validatedData = c.req.valid("param") as { filename: string }
   const filename = validatedData.filename
@@ -172,7 +170,7 @@ files.get("/:filename{.*}", filenameValidator, async (c) => {
       url,
       method,
       headers,
-      int(c.env.RANGE_RETRY_ATTEMPTS, "RANGE_RETRY_ATTEMPTS"),
+      parseInteger(c.env.RANGE_RETRY_ATTEMPTS, "RANGE_RETRY_ATTEMPTS"),
       c.env,
       c.req.raw,
     )

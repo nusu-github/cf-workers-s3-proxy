@@ -80,16 +80,6 @@ function validateRangeResponse(
 }
 
 /**
- * Updates metrics based on response content length
- */
-function updateResponseMetrics(response: Response): void {
-  const contentLength = Number(response.headers.get("content-length") ?? "0")
-  if (contentLength > 0) {
-    globalThis.__app_metrics.bytesSent += contentLength
-  }
-}
-
-/**
  * Handles server error responses
  */
 function handleServerError(response: Response): Response {
@@ -99,7 +89,6 @@ function handleServerError(response: Response): Response {
         `Upstream responded with server error: ${response.status}`,
       )
     }
-    updateResponseMetrics(response)
     return response
   }
   return response
@@ -125,10 +114,8 @@ async function performS3FetchAttempt(
 
   const handledResponse = handleServerError(response)
 
-  // Update metrics for successful responses
+  // Clone the response to avoid "Body has already been used" errors
   if (handledResponse.ok) {
-    updateResponseMetrics(handledResponse)
-    // Clone the response to avoid "Body has already been used" errors
     return handledResponse.clone()
   }
 

@@ -2,62 +2,66 @@ import { z } from "zod"
 import { getBooleanEnv } from "./utils.js"
 
 /**
- * Comprehensive environment variable validation using Zod with fail-fast behavior
- * This ensures all required configurations are present and valid before processing requests
+ * Environment variable validation using Zod with fail-fast behavior
+ * Ensures all required configurations are present and valid before processing requests
  *
  * Note: Handles both JSON types (from wrangler.jsonc vars) and string types (from secrets, .dev.vars)
  */
 
-// Custom Zod transforms for handling mixed string/boolean types from environment
-const booleanFromEnv = z
+// Transform for handling mixed string/boolean types from environment
+const booleanTransform = z
   .union([z.boolean(), z.string()])
-  .transform((val) => {
-    if (typeof val === "boolean") return val
-    const lower = val.toLowerCase()
-    if (lower === "true" || lower === "1") return true
-    if (lower === "false" || lower === "0") return false
+  .transform((value) => {
+    if (typeof value === "boolean") return value
+
+    const normalized = value.toLowerCase()
+    if (normalized === "true" || normalized === "1") return true
+    if (normalized === "false" || normalized === "0") return false
+
     throw new Error("must be a boolean value (true/false or 1/0)")
   })
   .optional()
 
-// Custom transform for handling mixed number/string types from environment
-const numberFromEnv = z.union([z.number(), z.string()]).transform((val) => {
-  if (typeof val === "number") return val
-  const num = Number.parseInt(String(val), 10)
-  if (Number.isNaN(num)) {
-    throw new Error("must be a valid integer")
-  }
-  return num
-})
+// Transform for handling mixed number/string types from environment
+const integerTransform = z
+  .union([z.number(), z.string()])
+  .transform((value) => {
+    if (typeof value === "number") return value
+
+    const parsedNumber = Number.parseInt(String(value), 10)
+    if (Number.isNaN(parsedNumber)) {
+      throw new Error("must be a valid integer")
+    }
+    return parsedNumber
+  })
 
 /**
- * Creates a number schema with range validation
+ * Creates integer schema with range validation
  */
-function numberWithRange(min: number, max: number) {
-  return numberFromEnv
-    .refine((val) => val >= min && val <= max, {
-      message: `must be >= ${min} and <= ${max}`,
+function createRangedInteger(minValue: number, maxValue: number) {
+  return integerTransform
+    .refine((value) => value >= minValue && value <= maxValue, {
+      message: `must be >= ${minValue} and <= ${maxValue}`,
     })
     .optional()
+}
+
+function isValidHttpUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url)
+    return parsed.protocol.startsWith("http")
+  } catch {
+    return false
+  }
 }
 
 // URL validation with proper error messages
 const httpUrlSchema = z
   .string()
   .url("must be a valid URL")
-  .refine(
-    (url) => {
-      try {
-        const parsed = new URL(url)
-        return parsed.protocol.startsWith("http")
-      } catch {
-        return false
-      }
-    },
-    { message: "must be a valid HTTPS URL" },
-  )
+  .refine(isValidHttpUrl, { message: "must be a valid HTTPS URL" })
 
-// AWS region validation
+// AWS region validation - follows standard AWS region naming pattern
 const awsRegionSchema = z
   .string()
   .regex(
@@ -65,7 +69,13 @@ const awsRegionSchema = z
     "must be a valid AWS region identifier (e.g., us-east-1, eu-west-1)",
   )
 
-// S3 bucket name validation
+function isValidS3BucketName(name: string): boolean {
+  if (name.includes("..")) return false
+  if (name.startsWith(".") || name.endsWith(".")) return false
+  return true
+}
+
+// S3 bucket name validation according to AWS specifications
 const s3BucketNameSchema = z
   .string()
   .min(3, "must be at least 3 characters long")
@@ -74,89 +84,118 @@ const s3BucketNameSchema = z
     /^[a-z0-9.-]+$/,
     "must contain only lowercase letters, numbers, dots, and hyphens",
   )
-  .refine((name) => !name.includes(".."), {
-    message: "must not contain consecutive dots",
-  })
-  .refine((name) => !name.startsWith(".") && !name.endsWith("."), {
-    message: "must not start or end with dots",
+  .refine(isValidS3BucketName, {
+    message: "must not contain consecutive dots or start/end with dots",
   })
 
-// CORS origins validation
-const corsOriginsSchema = z
-  .string()
-  .optional()
-  .refine(
-    (origins) => {
-      if (!origins || origins === "*") return true
-      const originList = origins.split(",").map((o) => o.trim())
-      for (const origin of originList) {
-        if (origin && origin !== "*") {
-          try {
-            new URL(origin)
-          } catch {
-            return false
-          }
-        }
-      }
+function validateCorsOrigins(origins: string | undefined): boolean {
+  if (!origins || origins === "*") return true
+
+  const originList = origins.split(",").map((origin) => origin.trim())
+  return originList.every((origin) => {
+    if (!origin || origin === "*") return true
+
+    try {
+      new URL(origin)
       return true
-    },
-    { message: "Invalid CORS origin format. Must be a valid URL or '*'" },
-  )
+    } catch {
+      return false
+    }
+  })
+}
 
-// URL signing paths validation
+// CORS origins validation - supports wildcard or comma-separated URLs
+const corsOriginsSchema = z.string().optional().refine(validateCorsOrigins, {
+  message: "Invalid CORS origin format. Must be a valid URL or '*'",
+})
+
+function validateUrlSigningPaths(paths: string | undefined): boolean {
+  if (!paths) return true
+
+  const pathList = paths.split(",").map((path) => path.trim())
+  return pathList.every((path) => !path || path.startsWith("/"))
+}
+
+// URL signing paths validation - ensures all paths start with '/'
 const urlSigningPathsSchema = z
   .string()
   .optional()
-  .refine(
-    (paths) => {
-      if (!paths) return true
-      const pathList = paths.split(",").map((p) => p.trim())
-      for (const path of pathList) {
-        if (path && !path.startsWith("/")) {
-          return false
-        }
-      }
-      return true
-    },
-    { message: "Paths must start with '/'" },
-  )
+  .refine(validateUrlSigningPaths, {
+    message: "Paths must start with '/'",
+  })
 
-// URL signing secret validation
+function hasMinimumSecretLength(secret: string | undefined): boolean {
+  return !secret || secret.length >= 32
+}
+
+function hasAdequateEntropy(secret: string | undefined): boolean {
+  if (!secret) return true
+
+  const hasLowercase = /[a-z]/.test(secret)
+  const hasUppercase = /[A-Z]/.test(secret)
+  const hasNumbers = /[0-9]/.test(secret)
+  const hasSpecialChars = /[^a-zA-Z0-9]/.test(secret)
+
+  const entropyScore = [
+    hasLowercase,
+    hasUppercase,
+    hasNumbers,
+    hasSpecialChars,
+  ].filter(Boolean).length
+
+  return entropyScore >= 2
+}
+
+// URL signing secret validation with length and entropy requirements
 const urlSigningSecretSchema = z
   .string()
   .optional()
-  .refine(
-    (secret) => {
-      if (!secret) return true
-      return secret.length >= 32
-    },
-    { message: "must be at least 32 characters long for security" },
-  )
-  .refine(
-    (secret) => {
-      if (!secret) return true
-      // Check for reasonable entropy
-      const hasLowercase = /[a-z]/.test(secret)
-      const hasUppercase = /[A-Z]/.test(secret)
-      const hasNumbers = /[0-9]/.test(secret)
-      const hasSpecialChars = /[^a-zA-Z0-9]/.test(secret)
+  .refine(hasMinimumSecretLength, {
+    message: "must be at least 32 characters long for security",
+  })
+  .refine(hasAdequateEntropy, {
+    message:
+      "should contain a mix of characters for better security (uppercase, lowercase, numbers, special characters)",
+  })
 
-      const entropyScore = [
-        hasLowercase,
-        hasUppercase,
-        hasNumbers,
-        hasSpecialChars,
-      ].filter(Boolean).length
+function validateCacheTtlRelationship(data: {
+  CACHE_MIN_TTL_SECONDS?: number
+  CACHE_MAX_TTL_SECONDS?: number
+}): boolean {
+  const { CACHE_MIN_TTL_SECONDS: minTtl, CACHE_MAX_TTL_SECONDS: maxTtl } = data
 
-      return entropyScore >= 2
-    },
-    {
-      message:
-        "should contain a mix of characters for better security (uppercase, lowercase, numbers, special characters)",
-    },
-  )
+  if (minTtl !== undefined && maxTtl !== undefined) {
+    return minTtl <= maxTtl
+  }
+  return true
+}
 
-// Main environment schema
+function validateUrlSigningConfiguration(data: {
+  ENFORCE_URL_SIGNING?: boolean
+  URL_SIGNING_SECRET?: string
+}): boolean {
+  const isEnforced = getBooleanEnv(data.ENFORCE_URL_SIGNING, false)
+  return !(isEnforced && !data.URL_SIGNING_SECRET)
+}
+
+function validateUrlSigningPathsConfiguration(data: {
+  URL_SIGNING_REQUIRED_PATHS?: string
+  URL_SIGNING_SECRET?: string
+}): boolean {
+  const {
+    URL_SIGNING_REQUIRED_PATHS: requiredPaths,
+    URL_SIGNING_SECRET: secret,
+  } = data
+
+  if (!requiredPaths) return true
+
+  const pathList = requiredPaths.split(",").map((path) => path.trim())
+  const hasValidPaths = pathList.length > 0 && pathList.some((path) => path)
+
+  return !(hasValidPaths && !secret)
+}
+
+// Environment validation schema with comprehensive checks
 const envSchema = z
   .object({
     // Required string variables
@@ -167,25 +206,28 @@ const envSchema = z
     S3_REGION: awsRegionSchema,
 
     // Required numeric variable
-    RANGE_RETRY_ATTEMPTS: numberFromEnv.refine((val) => val >= 1 && val <= 10, {
-      message: "must be a valid integer between 1 and 10",
-    }),
+    RANGE_RETRY_ATTEMPTS: integerTransform.refine(
+      (value) => value >= 1 && value <= 10,
+      {
+        message: "must be a valid integer between 1 and 10",
+      },
+    ),
 
-    // Optional numeric variables with ranges - using helper function
-    CACHE_TTL_SECONDS: numberWithRange(1, 604800),
-    CACHE_MIN_TTL_SECONDS: numberWithRange(1, 86400),
-    CACHE_MAX_TTL_SECONDS: numberWithRange(60, 604800),
-    PREFIX_MAX_LENGTH: numberWithRange(1, 1024),
-    PREFIX_MAX_DEPTH: numberWithRange(1, 50),
+    // Optional numeric variables with predefined ranges
+    CACHE_TTL_SECONDS: createRangedInteger(1, 604800), // 1 second to 7 days
+    CACHE_MIN_TTL_SECONDS: createRangedInteger(1, 86400), // 1 second to 1 day
+    CACHE_MAX_TTL_SECONDS: createRangedInteger(60, 604800), // 1 minute to 7 days
+    PREFIX_MAX_LENGTH: createRangedInteger(1, 1024),
+    PREFIX_MAX_DEPTH: createRangedInteger(1, 50),
 
-    // Boolean variables
-    CACHE_ENABLED: booleanFromEnv,
-    CACHE_OVERRIDE_S3_HEADERS: booleanFromEnv,
-    CACHE_DEBUG: booleanFromEnv,
-    ENFORCE_URL_SIGNING: booleanFromEnv,
-    ENABLE_LIST_ENDPOINT: booleanFromEnv,
-    ENABLE_UPLOAD_ENDPOINT: booleanFromEnv,
-    ENABLE_DELETE_ENDPOINT: booleanFromEnv,
+    // Boolean feature flags
+    CACHE_ENABLED: booleanTransform,
+    CACHE_OVERRIDE_S3_HEADERS: booleanTransform,
+    CACHE_DEBUG: booleanTransform,
+    ENFORCE_URL_SIGNING: booleanTransform,
+    ENABLE_LIST_ENDPOINT: booleanTransform,
+    ENABLE_UPLOAD_ENDPOINT: booleanTransform,
+    ENABLE_DELETE_ENDPOINT: booleanTransform,
 
     // Optional string variables with custom validation
     CORS_ALLOW_ORIGINS: corsOriginsSchema,
@@ -194,53 +236,36 @@ const envSchema = z
     CACHE_PURGE_SECRET: z.string().optional(),
     VERSION: z.string().optional(),
   })
-  .refine(
-    (data) => {
-      // Validate cache TTL relationships
-      if (
-        data.CACHE_MIN_TTL_SECONDS !== undefined &&
-        data.CACHE_MAX_TTL_SECONDS !== undefined
-      ) {
-        return data.CACHE_MIN_TTL_SECONDS <= data.CACHE_MAX_TTL_SECONDS
-      }
-      return true
-    },
-    {
-      message: "CACHE_MIN_TTL_SECONDS must be <= CACHE_MAX_TTL_SECONDS",
-      path: ["CACHE_MIN_TTL_SECONDS"],
-    },
-  )
-  .refine(
-    (data) => {
-      // Validate URL signing configuration
-      const enforceUrlSigning = getBooleanEnv(data.ENFORCE_URL_SIGNING, false)
-      return !(enforceUrlSigning && !data.URL_SIGNING_SECRET)
-    },
-    {
-      message:
-        "URL_SIGNING_SECRET is required when ENFORCE_URL_SIGNING is enabled",
-      path: ["URL_SIGNING_SECRET"],
-    },
-  )
-  .refine(
-    (data) => {
-      // Validate URL signing required paths configuration
-      if (data.URL_SIGNING_REQUIRED_PATHS) {
-        const paths = data.URL_SIGNING_REQUIRED_PATHS.split(",").map((p) =>
-          p.trim(),
-        )
-        if (paths.length > 0 && !data.URL_SIGNING_SECRET) {
-          return false
-        }
-      }
-      return true
-    },
-    {
-      message:
-        "URL_SIGNING_SECRET is required when URL_SIGNING_REQUIRED_PATHS is configured",
-      path: ["URL_SIGNING_SECRET"],
-    },
-  )
+  .refine(validateCacheTtlRelationship, {
+    message: "CACHE_MIN_TTL_SECONDS must be <= CACHE_MAX_TTL_SECONDS",
+    path: ["CACHE_MIN_TTL_SECONDS"],
+  })
+  .refine(validateUrlSigningConfiguration, {
+    message:
+      "URL_SIGNING_SECRET is required when ENFORCE_URL_SIGNING is enabled",
+    path: ["URL_SIGNING_SECRET"],
+  })
+  .refine(validateUrlSigningPathsConfiguration, {
+    message:
+      "URL_SIGNING_SECRET is required when URL_SIGNING_REQUIRED_PATHS is configured",
+    path: ["URL_SIGNING_SECRET"],
+  })
+
+function formatValidationErrors(errors: z.ZodIssue[]): string {
+  const errorMessages = errors.map((error) => {
+    const fieldPath = error.path.join(".")
+    return `${fieldPath} ${error.message}`
+  })
+
+  return [
+    "❌ Environment variable validation failed:",
+    "",
+    ...errorMessages.map((error) => `  • ${error}`),
+    "",
+    "Please check your wrangler.jsonc configuration and environment variables.",
+    "Refer to the documentation for proper configuration values.",
+  ].join("\n")
+}
 
 /**
  * Validates environment variables using Zod schema
@@ -251,37 +276,24 @@ export function validateEnvironment(env: Env): void {
     envSchema.parse(env)
   } catch (error) {
     if (error instanceof z.ZodError) {
-      const errorMessages = error.errors.map((err) => {
-        const field = err.path.join(".")
-        return `${field} ${err.message}`
-      })
-
-      const errorMessage = [
-        "❌ Environment variable validation failed:",
-        "",
-        ...errorMessages.map((error) => `  • ${error}`),
-        "",
-        "Please check your wrangler.jsonc configuration and environment variables.",
-        "Refer to the documentation for proper configuration values.",
-      ].join("\n")
-
-      throw new Error(errorMessage)
+      const formattedError = formatValidationErrors(error.errors)
+      throw new Error(formattedError)
     }
     throw error
   }
 }
 
-// Global flag to ensure validation runs only once per isolate
-let environmentValidated = false
+// Isolate-level validation state to prevent duplicate validation
+let isEnvironmentValidated = false
 
 /**
  * Ensures environment validation runs exactly once per isolate
  * Implements fail-fast behavior for misconfigured Workers
  */
 export function ensureEnvironmentValidated(env: Env): void {
-  if (!environmentValidated) {
-    validateEnvironment(env)
-    environmentValidated = true
-    console.log("✅ Environment validation passed successfully")
-  }
+  if (isEnvironmentValidated) return
+
+  validateEnvironment(env)
+  isEnvironmentValidated = true
+  console.log("✅ Environment validation passed successfully")
 }

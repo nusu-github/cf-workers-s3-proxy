@@ -14,7 +14,6 @@ src/
 ├── lib/                     # Core library functions
 │   ├── aws-client.ts       # AWS client management, S3 fetch, presigned URL generation
 │   ├── cache.ts            # Caching functionality
-│   ├── metrics.ts          # Metrics collection
 │   ├── security.ts         # Security and validation
 │   ├── utils.ts            # Utility functions
 │   └── validation.ts       # Environment validation
@@ -22,7 +21,7 @@ src/
 │   ├── setup.ts            # CORS, logging, security headers, timing, ETag, compression
 ├── routes/                  # Route handlers
 │   ├── health.ts           # Health check endpoints
-│   ├── metrics.ts          # Metrics endpoints
+│   ├── cache.ts            # Cache management endpoints
 │   ├── list.ts             # S3 list operations
 │   ├── files.ts            # File GET/HEAD operations
 │   ├── upload.ts           # Upload operations (PUT, presigned URLs, multipart initiation)
@@ -40,11 +39,6 @@ src/
 - `CacheConfig` interface for cache configuration
 - `CacheResult` interface for cache operation results
 - `CfProperties` for CloudFlare-specific fetch options
-
-**metrics.ts**
-
-- `AppMetrics` interface for application metrics, including upload/delete counters
-- Global metrics declaration
 
 **s3.ts**
 
@@ -68,12 +62,6 @@ src/
 - TTL calculation from response headers
 - Intelligent caching with CloudFlare Workers
 - Cache hit/miss tracking
-
-**metrics.ts**
-
-- Metrics initialization
-- Prometheus metrics generation (including upload/delete metrics)
-- Metrics collection helpers
 
 **security.ts**
 
@@ -101,7 +89,6 @@ src/
 - Security headers configuration
 - CORS setup with environment-based origins
 - Request ID and logging middleware
-- Metrics tracking middleware
 
 ### Route Handlers (`routes/`)
 
@@ -110,14 +97,11 @@ src/
 - Root route (404)
 - Health check endpoint (`/__health`)
 
-**metrics.ts**
-
-- Prometheus metrics endpoint (`/__metrics`) including write operation metrics
-- Cache statistics endpoint (`/__cache/stats`)
-
 **cache.ts**
 
+- Cache configuration endpoint (`/__cache/stats`)
 - Cache purging endpoint (`/__cache/purge`)
+- Cache health check endpoint (`/__cache/health`)
 
 **list.ts**
 
@@ -187,7 +171,7 @@ src/
 
 - **Stream Handling**: Better support for streaming uploads and downloads
 - **Header Validation**: Comprehensive header validation and forwarding
-- **Context Variables**: Request context management for debugging and metrics
+- **Context Variables**: Request context management for debugging
 - **Content Disposition**: Smart filename handling for downloads
 
 **Response Enhancement:**
@@ -271,7 +255,7 @@ src/
 ### 4. **Operational Excellence**
 
 - **Request Tracing**: Request IDs for tracking
-- **Performance Metrics**: Built-in timing information
+- **Performance Timing**: Built-in timing information
 - **Comprehensive Logging**: Enhanced logging capabilities
 - **Health Monitoring**: Better observability
 
@@ -287,7 +271,7 @@ src/
 ### Context Management
 
 ```typescript
-// Request context for debugging and metrics
+// Request context for debugging
 c.set("operation", "file-get");
 c.set("filename", filename);
 c.set("rangeRequest", true);
@@ -320,7 +304,7 @@ return c.json({
 ```
 
 This implementation showcases how to effectively leverage Hono's powerful features to build a production-ready,
-high-performance S3 proxy service with comprehensive security, monitoring, and developer experience features.
+high-performance S3 proxy service with comprehensive security and developer experience features.
 
 ## Key Benefits of This Structure
 
@@ -440,7 +424,7 @@ To implement upload functionality in `routes/upload.ts`:
 2. Add authentication/authorization checks
 3. Implement file validation (size, type, etc.)
 4. Handle multipart uploads for large files
-5. Add proper error handling and metrics
+5. Add proper error handling
 6. Update the main `index.ts` if needed
 
 ### Adding Delete Operations
@@ -487,13 +471,11 @@ To implement delete functionality in `routes/delete.ts`:
 - Use caching where appropriate
 - Minimize redundant operations
 - Leverage CloudFlare Workers optimizations
-- Monitor metrics for performance issues
 
 ## Future Improvements
 
 1. **Testing Framework**: Add comprehensive unit and integration tests
 2. **Documentation**: Add JSDoc comments for better IDE support
 3. **Configuration**: Add runtime configuration validation
-4. **Monitoring**: Enhanced metrics and alerting
-5. **Security**: Additional security headers and validation
-6. **Performance**: Further caching optimizations
+4. **Security**: Additional security headers and validation
+5. **Performance**: Further caching optimizations

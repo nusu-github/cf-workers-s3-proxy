@@ -229,21 +229,11 @@ async function handleCacheApiRequest(
         cachedResponse,
       )
       if (conditionalResponse) {
-        globalThis.__app_metrics.notModifiedResponses++
         return {
           response: conditionalResponse,
           cacheResult: { hit: true, source: "cache", key: cacheKey },
         }
       }
-    }
-
-    // Update cache metrics
-    globalThis.__app_metrics.cacheHits++
-    const contentLength = Number(
-      cachedResponse.headers.get("content-length") ?? "0",
-    )
-    if (contentLength > 0) {
-      globalThis.__app_metrics.cacheBytesServed += contentLength
     }
 
     if (config.debug) {
@@ -269,35 +259,8 @@ async function handleCacheApiRequest(
     }
   } catch (cacheError) {
     console.warn("Cache API error:", cacheError)
-    globalThis.__app_metrics.cacheErrors++
     return null
   }
-}
-
-/**
- * Updates metrics based on cache status and response
- */
-function updateCacheMetrics(
-  cfCacheStatus: string | null,
-  contentLength: number,
-): boolean {
-  const isEdgeHit = cfCacheStatus === "HIT"
-
-  if (isEdgeHit) {
-    globalThis.__app_metrics.cacheHits++
-    if (contentLength > 0) {
-      globalThis.__app_metrics.cacheBytesServed += contentLength
-    }
-  } else {
-    globalThis.__app_metrics.cacheMisses++
-  }
-
-  // Update general metrics
-  if (contentLength > 0) {
-    globalThis.__app_metrics.bytesSent += contentLength
-  }
-
-  return isEdgeHit
 }
 
 /**
@@ -332,13 +295,9 @@ async function storeInCacheApi(
     // Store in Cache API (fire and forget)
     cache.put(cacheRequest, responseWithHeaders).catch((putError) => {
       console.warn("Failed to store in Cache API:", putError)
-      globalThis.__app_metrics.cacheErrors++
     })
-
-    globalThis.__app_metrics.cacheStores++
   } catch (storeError) {
     console.warn("Cache storage error:", storeError)
-    globalThis.__app_metrics.cacheErrors++
   }
 }
 
@@ -389,6 +348,112 @@ async function performFetchAttempt(
 }
 
 /**
+ * Handles the case when caching is disabled
+ */
+async function handleCachingDisabled(
+  signer: AwsClient,
+  url: string,
+  method: HttpMethod,
+  headers: Headers,
+  attempts: number,
+  cacheKey: string,
+): Promise<{ response: Response; cacheResult: CacheResult }> {
+  const { s3Fetch } = await import("./aws-client.js")
+  const response = await s3Fetch(signer, url, method, headers, attempts)
+  return {
+    response,
+    cacheResult: { hit: false, source: "s3", key: cacheKey },
+  }
+}
+
+/**
+ * Creates cache result object with optional debug response
+ */
+function createCacheResult(
+  response: Response,
+  isEdgeHit: boolean,
+  cacheKey: string,
+  config: CacheConfig,
+): { response: Response; cacheResult: CacheResult } {
+  const finalCacheResult: CacheResult = {
+    hit: isEdgeHit,
+    source: isEdgeHit ? "cache" : "s3",
+    key: cacheKey,
+    ttl: isEdgeHit ? undefined : calculateTtl(response, config),
+  }
+
+  if (config.debug) {
+    console.log("Cache result:", finalCacheResult)
+    console.log(`CF-Cache-Status: ${response.headers.get("cf-cache-status")}`)
+  }
+
+  // Clone response and add debug headers - avoid body consumption issues
+  const clonedResponse = response.clone()
+  if (config.debug) {
+    // Create new response with mutable headers for debug info
+    const responseWithDebug = new Response(clonedResponse.body, {
+      status: clonedResponse.status,
+      statusText: clonedResponse.statusText,
+      headers: new Headers(clonedResponse.headers),
+    })
+    responseWithDebug.headers.set(
+      "X-Cache-Debug",
+      JSON.stringify(finalCacheResult),
+    )
+    return { response: responseWithDebug, cacheResult: finalCacheResult }
+  }
+
+  return { response: clonedResponse, cacheResult: finalCacheResult }
+}
+
+/**
+ * Performs the main fetch and cache operation loop
+ */
+async function performFetchWithRetry(
+  signer: AwsClient,
+  url: string,
+  method: HttpMethod,
+  headers: Headers,
+  attempts: number,
+  config: CacheConfig,
+  cacheKey: string,
+  cache: Cache,
+  cacheRequest: Request,
+): Promise<{ response: Response; cacheResult: CacheResult }> {
+  let attempt = 0
+  let lastErr: unknown
+
+  while (attempt < attempts) {
+    try {
+      const res = await performFetchAttempt(
+        signer,
+        url,
+        method,
+        headers,
+        config,
+        cacheKey,
+      )
+
+      // Track cache metrics
+      const cfCacheStatus = res.headers.get("cf-cache-status")
+      const isEdgeHit = cfCacheStatus === "HIT"
+
+      // Store in Cache API if applicable
+      await storeInCacheApi(res, method, cache, cacheRequest, config, isEdgeHit)
+
+      return createCacheResult(res, isEdgeHit, cacheKey, config)
+    } catch (e) {
+      lastErr = e
+      const backoff = 200 * 2 ** attempt + Math.random() * 100
+      await new Promise((r) => setTimeout(r, backoff))
+      attempt++
+    }
+  }
+
+  throw new Error(`Failed after ${attempts} attempts: ${String(lastErr)}`)
+}
+
+/**
  * Hybrid cache implementation using both Cache API and edge caching
  */
 export async function cachedS3Fetch(
@@ -410,12 +475,14 @@ export async function cachedS3Fetch(
 
   // If caching is disabled, use original s3Fetch
   if (!config.enabled) {
-    const { s3Fetch } = await import("./aws-client.js")
-    const response = await s3Fetch(signer, url, method, headers, attempts)
-    return {
-      response,
-      cacheResult: { hit: false, source: "s3", key: cacheKey },
-    }
+    return handleCachingDisabled(
+      signer,
+      url,
+      method,
+      headers,
+      attempts,
+      cacheKey,
+    )
   }
 
   // Get cache instance
@@ -436,67 +503,17 @@ export async function cachedS3Fetch(
   }
 
   // Cache miss - fetch from S3 with hybrid caching
-  let attempt = 0
-  let lastErr: unknown
-
-  while (attempt < attempts) {
-    try {
-      const res = await performFetchAttempt(
-        signer,
-        url,
-        method,
-        headers,
-        config,
-        cacheKey,
-      )
-
-      // Track cache metrics
-      const cfCacheStatus = res.headers.get("cf-cache-status")
-      const contentLength = Number(res.headers.get("content-length") ?? "0")
-      const isEdgeHit = updateCacheMetrics(cfCacheStatus, contentLength)
-
-      // Store in Cache API if applicable
-      await storeInCacheApi(res, method, cache, cacheRequest, config, isEdgeHit)
-
-      const finalCacheResult: CacheResult = {
-        hit: isEdgeHit,
-        source: isEdgeHit ? "cache" : "s3",
-        key: cacheKey,
-        ttl: isEdgeHit ? undefined : calculateTtl(res, config),
-      }
-
-      if (config.debug) {
-        console.log("Cache result:", finalCacheResult)
-        console.log(`CF-Cache-Status: ${cfCacheStatus}`)
-      }
-
-      // Clone response and add debug headers - avoid body consumption issues
-      const response = res.clone()
-      if (config.debug) {
-        // Create new response with mutable headers for debug info
-        const responseWithDebug = new Response(response.body, {
-          status: response.status,
-          statusText: response.statusText,
-          headers: new Headers(response.headers),
-        })
-        responseWithDebug.headers.set(
-          "X-Cache-Debug",
-          JSON.stringify(finalCacheResult),
-        )
-        return { response: responseWithDebug, cacheResult: finalCacheResult }
-      }
-
-      return { response, cacheResult: finalCacheResult }
-    } catch (e) {
-      lastErr = e
-      globalThis.__app_metrics.cacheErrors++
-      const backoff = 200 * 2 ** attempt + Math.random() * 100
-      await new Promise((r) => setTimeout(r, backoff))
-      attempt++
-    }
-  }
-
-  throw new Error(`Failed after ${attempts} attempts: ${String(lastErr)}`)
+  return performFetchWithRetry(
+    signer,
+    url,
+    method,
+    headers,
+    attempts,
+    config,
+    cacheKey,
+    cache,
+    cacheRequest,
+  )
 }
 
 /**

@@ -1,6 +1,6 @@
 import { HTTPException } from "hono/http-exception"
 
-import { createCanonicalQueryString, int } from "./utils.js"
+import { createCanonicalQueryString, parseInteger } from "./utils.js"
 
 const globalEncoder = new TextEncoder()
 
@@ -201,8 +201,14 @@ export function validateAndSanitizePrefix(prefix: string, env: Env): string {
   let sanitized = prefix.trim()
 
   // Get configuration limits with defaults
-  const maxLength = int(env.PREFIX_MAX_LENGTH ?? "512", "PREFIX_MAX_LENGTH")
-  const maxDepth = int(env.PREFIX_MAX_DEPTH ?? "10", "PREFIX_MAX_DEPTH")
+  const maxLength = parseInteger(
+    env.PREFIX_MAX_LENGTH ?? "512",
+    "PREFIX_MAX_LENGTH",
+  )
+  const maxDepth = parseInteger(
+    env.PREFIX_MAX_DEPTH ?? "10",
+    "PREFIX_MAX_DEPTH",
+  )
 
   // Validate prefix length
   validatePrefixLength(sanitized, maxLength)

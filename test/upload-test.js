@@ -146,7 +146,7 @@ class UploadTestSuite {
           } else {
             console.error("   Response: [Body already consumed]")
           }
-        } catch (readError) {
+        } catch (_readError) {
           console.error("   Response: [Could not read response body]")
         }
       }

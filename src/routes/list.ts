@@ -159,7 +159,6 @@ function parseS3Response(xmlData: string): S3ListResponse {
 // List objects – GET /list?prefix=&continuationToken=
 list.get("/list", async (c) => {
   ensureEnvironmentValidated(c.env)
-  globalThis.__app_metrics.totalRequests++
 
   await validateListAccess(c)
 

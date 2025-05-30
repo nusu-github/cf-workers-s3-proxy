@@ -1,26 +1,26 @@
-/** Convenience parser for ints that throws on NaN - supports both number and string types */
-export const int = (
+/** Convenience parser for integers that throws on NaN - supports both number and string types */
+export const parseInteger = (
   value: number | string | undefined,
-  key: string,
+  fieldName: string,
 ): number => {
   if (value === undefined || value === null) {
-    throw new Error(`${key} binding is missing`)
+    throw new Error(`${fieldName} binding is missing`)
   }
 
   // If it's already a number, validate and return it
   if (typeof value === "number") {
     if (Number.isNaN(value) || !Number.isInteger(value)) {
-      throw new Error(`${key} is not a valid integer`)
+      throw new Error(`${fieldName} is not a valid integer`)
     }
     return value
   }
 
   // If it's a string, parse it
-  const n = Number.parseInt(value, 10)
-  if (Number.isNaN(n)) {
-    throw new Error(`${key} is not a valid integer`)
+  const parsedNumber = Number.parseInt(value, 10)
+  if (Number.isNaN(parsedNumber)) {
+    throw new Error(`${fieldName} is not a valid integer`)
   }
-  return n
+  return parsedNumber
 }
 
 /**
@@ -91,51 +91,51 @@ export const getBooleanEnv = (
 }
 
 /**
- * Enhanced sanitization for Content-Disposition filename parameter.
- * Prevents security issues in filename handling across different browsers and file systems.
+ * Removes path traversal attempts and directory separators
  */
-export function sanitizeDownloadFilename(
-  dlName: string,
-  defaultName: string,
-): string {
-  // Remove leading/trailing whitespace
-  let sanitized = dlName.trim()
+function removePathTraversalCharacters(filename: string): string {
+  return filename.replace(/[\/\\]/g, "").replace(/\.\./g, "")
+}
 
-  // Prevent excessively long filenames
-  if (sanitized.length > 255) {
-    sanitized = sanitized.substring(0, 255)
-  }
-
-  // Remove path traversal attempts and directory separators
-  sanitized = sanitized.replace(/[\/\\]/g, "")
-  sanitized = sanitized.replace(/\.\./g, "")
-
-  // Remove or replace problematic characters for Content-Disposition
+/**
+ * Removes problematic characters for Content-Disposition
+ */
+function removeProblematicCharacters(filename: string): string {
   // Keep only alphanumeric, dot, hyphen, underscore, space, and some safe punctuation
-  sanitized = sanitized.replace(/[^a-zA-Z0-9._\-\s()[\]]/g, "")
+  let sanitized = filename.replace(/[^a-zA-Z0-9._\-\s()[\]]/g, "")
 
   // Strip control characters (including Unicode control characters)
   // biome-ignore lint/suspicious/noControlCharactersInRegex: Unicode ranges needed for security validation
   sanitized = sanitized.replace(/[\u0000-\u001F\u007F\u0080-\u009F]/g, "")
 
-  // Collapse multiple spaces to single space and trim again
-  sanitized = sanitized.replace(/\s+/g, " ").trim()
+  return sanitized
+}
 
-  // Prevent filenames that start with problematic characters
+/**
+ * Normalizes whitespace in filename
+ */
+function normalizeWhitespace(filename: string): string {
+  return filename.replace(/\s+/g, " ").trim()
+}
+
+/**
+ * Removes problematic starting characters
+ */
+function removeProblematicStartingCharacters(filename: string): string {
   if (
-    sanitized.startsWith(".") ||
-    sanitized.startsWith("-") ||
-    sanitized.startsWith("_")
+    filename.startsWith(".") ||
+    filename.startsWith("-") ||
+    filename.startsWith("_")
   ) {
-    sanitized = sanitized.substring(1)
+    return filename.substring(1)
   }
+  return filename
+}
 
-  // Ensure filename has valid content and isn't empty
-  if (!sanitized || sanitized.length === 0) {
-    return defaultName
-  }
-
-  // Prevent reserved filenames on Windows (case-insensitive)
+/**
+ * Checks if filename is a Windows reserved name
+ */
+function isWindowsReservedName(filename: string): boolean {
   const reservedNames = [
     "CON",
     "PRN",
@@ -160,8 +160,39 @@ export function sanitizeDownloadFilename(
     "LPT8",
     "LPT9",
   ]
-  const nameWithoutExt = sanitized.split(".")[0]?.toUpperCase() ?? ""
-  if (reservedNames.includes(nameWithoutExt)) {
+  const nameWithoutExt = filename.split(".")[0]?.toUpperCase() ?? ""
+  return reservedNames.includes(nameWithoutExt)
+}
+
+/**
+ * Enhanced sanitization for Content-Disposition filename parameter.
+ * Prevents security issues in filename handling across different browsers and file systems.
+ */
+export function sanitizeDownloadFilename(
+  dlName: string,
+  defaultName: string,
+): string {
+  // Remove leading/trailing whitespace
+  let sanitized = dlName.trim()
+
+  // Prevent excessively long filenames
+  if (sanitized.length > 255) {
+    sanitized = sanitized.substring(0, 255)
+  }
+
+  // Apply sanitization steps
+  sanitized = removePathTraversalCharacters(sanitized)
+  sanitized = removeProblematicCharacters(sanitized)
+  sanitized = normalizeWhitespace(sanitized)
+  sanitized = removeProblematicStartingCharacters(sanitized)
+
+  // Ensure filename has valid content and isn't empty
+  if (!sanitized || sanitized.length === 0) {
+    return defaultName
+  }
+
+  // Prevent reserved filenames on Windows
+  if (isWindowsReservedName(sanitized)) {
     return defaultName
   }
 
