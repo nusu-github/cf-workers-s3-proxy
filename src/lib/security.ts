@@ -156,14 +156,14 @@ function sanitizeAndValidateCharacters(prefix: string): string {
 
   // Validate allowed characters for S3 object keys
   // S3 allows: letters, numbers, and these special characters: ! - _ . * ' ( ) /
-  // A more restrictive set of characters is enforced for security.
-  const allowedCharacterPattern = /^[a-zA-Z0-9\-_.\/'()*!]*$/
+  // Using a more restrictive set for enhanced security, excluding potentially problematic characters
+  const allowedCharacterPattern = /^[a-zA-Z0-9\-_.\/']*$/
   const hasOnlyAllowedChars = allowedCharacterPattern.test(withoutControlChars)
 
   if (!hasOnlyAllowedChars) {
     throw new HTTPException(400, {
       message:
-        "Prefix contains invalid characters. Only letters, numbers, and these special characters are allowed: - _ . / ' ( ) * !",
+        "Prefix contains invalid characters. Only letters, numbers, and these special characters are allowed: - _ . / '",
     })
   }
 

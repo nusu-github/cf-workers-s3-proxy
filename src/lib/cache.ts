@@ -265,10 +265,15 @@ async function handleCacheApiRequest(
       console.log("Cache hit from Cache API")
     }
 
-    // Clone the response and add cache debug headers - use clone() to avoid body consumption issues
+    // Clone the response and add cache debug headers - create new response with mutable headers
     const clonedResponse = cachedResponse.clone()
     if (config.debug) {
-      clonedResponse.headers.set(
+      const responseWithDebug = new Response(clonedResponse.body, {
+        status: clonedResponse.status,
+        statusText: clonedResponse.statusText,
+        headers: new Headers(clonedResponse.headers),
+      })
+      responseWithDebug.headers.set(
         "X-Cache-Debug",
         JSON.stringify({
           hit: true,
@@ -276,6 +281,10 @@ async function handleCacheApiRequest(
           key: cacheKey,
         }),
       )
+      return {
+        response: responseWithDebug,
+        cacheResult: { hit: true, source: "cache", key: cacheKey },
+      }
     }
 
     return {
@@ -326,10 +335,13 @@ async function storeInCacheApi(
       new Date().toISOString(),
     )
 
-    // Store in Cache API (fire and forget)
-    cache.put(cacheRequest, responseWithCacheHeaders).catch((putError) => {
+    // Store in Cache API with proper error handling
+    try {
+      await cache.put(cacheRequest, responseWithCacheHeaders)
+    } catch (putError) {
       console.warn("Failed to store in Cache API:", putError)
-    })
+      // Continue execution - cache failure shouldn't break the response
+    }
   } catch (storeError) {
     console.warn("Cache storage error:", storeError)
   }

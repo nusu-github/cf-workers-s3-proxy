@@ -113,8 +113,8 @@ function removePathTraversalCharacters(filename: string): string {
  * Removes problematic characters for Content-Disposition
  */
 function removeProblematicCharacters(filename: string): string {
-  // Keep only alphanumeric, dot, hyphen, underscore, space, and some safe punctuation
-  let sanitizedFilename = filename.replace(/[^a-zA-Z0-9._\-\s()[\]]/g, "")
+  // Keep only alphanumeric, dot, hyphen, underscore, space, and consistent safe punctuation
+  let sanitizedFilename = filename.replace(/[^a-zA-Z0-9._\-\s]/g, "")
 
   // Strip control characters (including Unicode control characters)
   // biome-ignore lint/suspicious/noControlCharactersInRegex: Unicode ranges needed for security validation
@@ -179,7 +179,8 @@ function isWindowsReservedName(filename: string): boolean {
     "LPT8",
     "LPT9",
   ]
-  const filenameWithoutExtension = filename.split(".")[0]?.toUpperCase() ?? ""
+  const nameParts = filename.split(".")
+  const filenameWithoutExtension = nameParts.length > 0 ? nameParts[0]?.toUpperCase() ?? "" : ""
   return windowsReservedNames.includes(filenameWithoutExtension)
 }
 

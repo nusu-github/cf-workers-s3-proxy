@@ -1,21 +1,17 @@
 import { AwsClient } from "aws4fetch"
 import { HttpMethod } from "../types/s3.js"
 
-let awsClientInstance: AwsClient | null = null
-
 /**
- * Returns a shared AwsClient instance, initializing it on first use.
+ * Creates a new AwsClient instance for each request to prevent credential sharing.
+ * This ensures security in edge environments where isolates may be reused.
  */
 export function getAwsClient(env: Env): AwsClient {
-  if (!awsClientInstance) {
-    awsClientInstance = new AwsClient({
-      service: "s3",
-      accessKeyId: env.ACCESS_KEY,
-      secretAccessKey: env.SECRET_KEY,
-      region: env.S3_REGION, // Use explicit S3_REGION instead of parsing from endpoint
-    })
-  }
-  return awsClientInstance
+  return new AwsClient({
+    service: "s3",
+    accessKeyId: env.ACCESS_KEY,
+    secretAccessKey: env.SECRET_KEY,
+    region: env.S3_REGION, // Use explicit S3_REGION instead of parsing from endpoint
+  })
 }
 
 /** Helper to construct S3 URLs */
@@ -135,7 +131,7 @@ async function performS3FetchAttempt(
     headers: headers,
   })
 
-  const response = await fetch(signedRequest.clone())
+  const response = await fetch(signedRequest)
 
   validateRangeResponse(method, headers, response)
 

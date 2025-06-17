@@ -311,17 +311,12 @@ export function validateEnvironment(env: Env): void {
   }
 }
 
-// Isolate-level validation state to prevent duplicate validation
-let isEnvironmentValidated = false
-
 /**
- * Ensures environment validation runs exactly once per isolate
+ * Ensures environment validation runs for each request
  * Implements fail-fast behavior for misconfigured Workers
+ * Note: Removed global state to ensure thread safety in edge environments
  */
 export function ensureEnvironmentValidated(env: Env): void {
-  if (isEnvironmentValidated) return
-
   validateEnvironment(env)
-  isEnvironmentValidated = true
   console.log("✅ Environment validation passed successfully")
 }
