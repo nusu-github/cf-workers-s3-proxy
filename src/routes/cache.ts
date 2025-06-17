@@ -22,10 +22,48 @@ const HTTP_STATUS = {
 } as const
 
 // ─────────────────────────────────────── Validation Schemas ───────────────────────────────────────
+// Safe regex pattern validation to prevent ReDoS attacks
+function isValidRegexPattern(pattern: string): boolean {
+  // Check for dangerous patterns that could cause ReDoS
+  const dangerousPatterns = [
+    /\(.*\+.*\).*\+/, // Nested quantifiers like (a+)+
+    /\(.*\*.*\).*\*/, // Nested quantifiers like (a*)*
+    /\(.*\{.*,.*\}.*\).*\{.*,.*\}/, // Nested range quantifiers
+    /\(.*\|.*\).*\+/, // Alternation with quantifiers
+  ]
+
+  if (dangerousPatterns.some((dangerous) => dangerous.test(pattern))) {
+    return false
+  }
+
+  // Limit pattern length to prevent excessive computation
+  if (pattern.length > 100) {
+    return false
+  }
+
+  try {
+    new RegExp(pattern)
+    return true
+  } catch {
+    return false
+  }
+}
+
 const purgeSchema = z
   .object({
     keys: z.array(z.string()).optional(),
-    pattern: z.string().optional(),
+    pattern: z
+      .string()
+      .optional()
+      .refine(
+        (pattern) => {
+          if (!pattern) return true
+          return isValidRegexPattern(pattern)
+        },
+        {
+          message: "Invalid or potentially dangerous regex pattern",
+        },
+      ),
     all: z.boolean().optional().default(false),
   })
   .refine((data) => data.keys || data.pattern || data.all, {
@@ -47,6 +85,24 @@ type CacheHealthStatus = "healthy" | "unhealthy" | "disabled"
 type AuthResult = {
   authenticated: boolean
   method?: "bearer" | "url-signature"
+}
+
+type CacheConfig = {
+  enabled: boolean
+  ttlSeconds: number
+  overrideS3Headers: boolean
+  minTtlSeconds: number
+  maxTtlSeconds: number
+  debug: boolean
+}
+
+type HealthTestResult = {
+  status: CacheHealthStatus
+  message: string
+  details: {
+    apiAvailable: boolean
+    operationSuccessful: boolean
+  }
 }
 
 // ─────────────────────────────────────── Auth Helper Functions ───────────────────────────────────────
@@ -81,20 +137,16 @@ async function validateUrlSignatureAuth(
   try {
     await verifySignature(new URL(c.req.url), c.env.URL_SIGNING_SECRET)
     return { authenticated: true, method: "url-signature" }
-  } catch (error) {
-    console.warn("URL signature validation failed:", {
-      endpoint,
-      error: error instanceof Error ? error.message : "Unknown error",
-    })
+  } catch (_error) {
+    // Log minimal information to prevent information disclosure
+    console.warn("URL signature validation failed for endpoint:", endpoint)
     return { authenticated: false }
   }
 }
 
-function throwAuthError(endpoint: string, hasAuthHeader: boolean): never {
-  console.error("Cache operation authentication failed:", {
-    endpoint,
-    hasAuthHeader,
-  })
+function throwAuthError(endpoint: string, _hasAuthHeader: boolean): never {
+  // Log minimal information for security
+  console.error("Cache operation authentication failed for endpoint:", endpoint)
   throw new HTTPException(HTTP_STATUS.FORBIDDEN, {
     message: "Invalid cache operation secret",
   })
@@ -182,16 +234,39 @@ function generateHealthTestKey(): string {
 }
 
 async function testCacheOperations(testKey: string): Promise<boolean> {
-  const testResponse = new Response(HEALTH_TEST_CONFIG.CONTENT, {
-    headers: { "Content-Type": HEALTH_TEST_CONFIG.CONTENT_TYPE },
-  })
+  let testResponse: Response | null = null
 
-  const cacheInstance = caches.default
-  await cacheInstance.put(testKey, testResponse.clone())
-  const retrieved = await cacheInstance.match(testKey)
-  await cacheInstance.delete(testKey)
+  try {
+    testResponse = new Response(HEALTH_TEST_CONFIG.CONTENT, {
+      headers: { "Content-Type": HEALTH_TEST_CONFIG.CONTENT_TYPE },
+    })
 
-  return retrieved !== undefined
+    const cacheInstance = caches.default
+    await cacheInstance.put(testKey, testResponse.clone())
+    const retrieved = await cacheInstance.match(testKey)
+
+    // Always attempt cleanup, even if retrieval fails
+    try {
+      await cacheInstance.delete(testKey)
+    } catch (_cleanupError) {
+      console.warn("Failed to cleanup test cache entry:", testKey)
+    }
+
+    return retrieved !== undefined
+  } catch (error) {
+    // Ensure cleanup even if operations fail
+    if (testKey) {
+      try {
+        await caches.default.delete(testKey)
+      } catch {
+        // Ignore cleanup errors in error path
+      }
+    }
+    throw error
+  } finally {
+    // Explicitly release response reference
+    testResponse = null
+  }
 }
 
 function createHealthResult(
@@ -199,7 +274,7 @@ function createHealthResult(
   message: string,
   apiAvailable: boolean,
   operationSuccessful: boolean,
-) {
+): HealthTestResult {
   return {
     status,
     message,
@@ -207,7 +282,7 @@ function createHealthResult(
   }
 }
 
-async function performCacheHealthTest() {
+async function performCacheHealthTest(): Promise<HealthTestResult> {
   try {
     const testKey = generateHealthTestKey()
     const isHealthy = await testCacheOperations(testKey)
@@ -218,11 +293,9 @@ async function performCacheHealthTest() {
       true,
       isHealthy,
     )
-  } catch (error) {
-    console.error("Cache health check failed:", {
-      error: error instanceof Error ? error.message : "Unknown error",
-      timestamp: new Date().toISOString(),
-    })
+  } catch (_error) {
+    // Log minimal error information to prevent information disclosure
+    console.error("Cache health check failed at:", new Date().toISOString())
 
     return createHealthResult(
       "unhealthy",
@@ -261,7 +334,7 @@ function createWarmingResponse(
   }
 }
 
-function createConfigResponse(config: ReturnType<typeof getCacheConfig>) {
+function createConfigResponse(config: CacheConfig) {
   return {
     config: {
       enabled: config.enabled,
@@ -316,16 +389,16 @@ cache.post("/__cache/warm", zValidator("json", warmSchema), async (c) => {
 })
 
 cache.get("/__cache/stats", (c) => {
-  const config = getCacheConfig(c.env)
+  const config = getCacheConfig(c.env) as CacheConfig
   return c.json(createConfigResponse(config))
 })
 
 cache.get("/__cache/health", async (c) => {
-  const config = getCacheConfig(c.env)
+  const config = getCacheConfig(c.env) as CacheConfig
 
   if (!config.enabled) {
     return c.json({
-      status: "disabled",
+      status: "disabled" as CacheHealthStatus,
       message: "Cache is disabled",
       timestamp: new Date().toISOString(),
     })

@@ -63,13 +63,37 @@ function mapS3ErrorToHttpStatus(errorCode: string): ContentfulStatusCode {
   )
 }
 
+function sanitizeErrorMessage(errorCode: string, errorMessage: string): string {
+  // Map known S3 error codes to safe user messages
+  const safeErrorMessages: Record<string, string> = {
+    NoSuchBucket: "Bucket not found",
+    NoSuchKey: "Object not found",
+    AccessDenied: "Access denied",
+    InvalidAccessKeyId: "Authentication failed",
+    SignatureDoesNotMatch: "Authentication failed",
+    InvalidBucketName: "Invalid bucket name",
+    InvalidArgument: "Invalid request parameters",
+    InternalError: "Internal server error",
+    ServiceUnavailable: "Service temporarily unavailable",
+    SlowDown: "Rate limit exceeded",
+    RequestTimeout: "Request timeout",
+  }
+
+  return safeErrorMessages[errorCode] || "Request failed"
+}
+
 function handleS3Error(parsedXml: S3ErrorResponse): never {
   const s3Error = parsedXml.Error
-  console.error("S3 returned error:", s3Error)
+  console.error("S3 returned error:", {
+    code: s3Error.Code,
+    requestId: s3Error.RequestId,
+  })
 
   const statusCode = mapS3ErrorToHttpStatus(s3Error.Code)
+  const safeMessage = sanitizeErrorMessage(s3Error.Code, s3Error.Message)
+
   throw new HTTPException(statusCode, {
-    message: `S3 Error: ${s3Error.Code} - ${s3Error.Message}`,
+    message: safeMessage,
   })
 }
 
@@ -121,11 +145,14 @@ function parseS3Response(xmlData: string): S3ListResponse {
 function createObjectMetadata(item: S3ObjectMetadata): S3ObjectMetadata | null {
   if (!item?.Key) return null
 
+  // Validate Size field - must be a non-negative number
+  const size = typeof item.Size === "number" && item.Size >= 0 ? item.Size : 0
+
   return {
     Key: item.Key,
     LastModified: item.LastModified || "",
     ETag: item.ETag || "",
-    Size: item.Size,
+    Size: size,
     StorageClass: item.StorageClass || "STANDARD",
   }
 }
@@ -210,6 +237,25 @@ function logDebugInfo(
 }
 
 // ─────────────────────────────────────── Request Helper Functions ───────────────────────────────────────
+function validateContinuationToken(token: string): void {
+  if (!token) return
+
+  // Validate token length to prevent abuse
+  if (token.length > 2048) {
+    throw new HTTPException(400, {
+      message: "Continuation token is too long",
+    })
+  }
+
+  // Validate token format - AWS continuation tokens are base64-like
+  const validTokenPattern = /^[A-Za-z0-9+/=_-]+$/
+  if (!validTokenPattern.test(token)) {
+    throw new HTTPException(400, {
+      message: "Invalid continuation token format",
+    })
+  }
+}
+
 function buildListUrl(
   baseUrl: string,
   prefix: string,
@@ -218,6 +264,7 @@ function buildListUrl(
   let listUrl = `${baseUrl}?list-type=2&prefix=${encodeURIComponent(prefix)}`
 
   if (continuationToken) {
+    validateContinuationToken(continuationToken)
     listUrl += `&continuation-token=${encodeURIComponent(continuationToken)}`
   }
 
@@ -227,11 +274,18 @@ function buildListUrl(
 function validateContentType(response: Response): void {
   const contentType = response.headers.get("content-type") || ""
 
-  if (
-    !contentType.includes("xml") &&
-    !contentType.includes("application/xml")
-  ) {
-    console.warn(`Unexpected content-type for S3 list response: ${contentType}`)
+  // Strict validation for XML content types
+  const validXmlTypes = ["application/xml", "text/xml", "application/x-xml"]
+
+  const isValidXmlType = validXmlTypes.some((validType) =>
+    contentType.toLowerCase().includes(validType),
+  )
+
+  if (!isValidXmlType) {
+    console.error(`Invalid content-type for S3 list response: ${contentType}`)
+    throw new HTTPException(HTTP_STATUS.BAD_GATEWAY, {
+      message: "Invalid response format from S3",
+    })
   }
 }
 
