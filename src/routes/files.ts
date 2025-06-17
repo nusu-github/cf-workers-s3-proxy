@@ -68,11 +68,21 @@ function determineContentDisposition(
   const downloadParam = c.req.query("download")
   const inlineParam = c.req.query("inline")
 
+  // Validate query parameters
+  if (downloadParam !== undefined && typeof downloadParam !== "string") {
+    return null
+  }
+  if (inlineParam !== undefined && typeof inlineParam !== "string") {
+    return null
+  }
+
   if (downloadParam !== undefined) {
     const defaultName = filename.split("/").pop() || "download"
     const requestedName = downloadParam || defaultName
     const sanitizedName = sanitizeDownloadFilename(requestedName, defaultName)
-    return `attachment; filename="${sanitizedName}"`
+    // Additional escaping to prevent header injection
+    const escapedName = sanitizedName.replace(/["\\\r\n]/g, "_")
+    return `attachment; filename="${escapedName}"`
   }
 
   if (inlineParam !== undefined) {
@@ -233,7 +243,11 @@ files.get("/:filename{.*}", filenameValidator, async (c) => {
   await enforceUrlSigning(c.env, `/${filename}`, c.req.url)
 
   try {
-    const method = c.req.raw.method as HttpMethod
+    // Validate method
+    const method = c.req.raw.method
+    if (method !== HttpMethod.GET) {
+      throw new HTTPException(405, { message: "Method not allowed" })
+    }
     return await processFileRequest(c, filename, method)
   } catch (error) {
     handleFileError(error, filename)
@@ -241,11 +255,18 @@ files.get("/:filename{.*}", filenameValidator, async (c) => {
 })
 
 files.on("HEAD", "/:filename{.*}", filenameValidator, async (c) => {
-  // Reuse GET logic with HEAD method
-  return files.fetch(
-    new Request(c.req.url, { method: "GET", headers: c.req.raw.headers }),
-    c.env,
-  )
+  ensureEnvironmentValidated(c.env)
+
+  const validatedData = c.req.valid("param") as { filename: string }
+  const filename = validatedData.filename
+
+  await enforceUrlSigning(c.env, `/${filename}`, c.req.url)
+
+  try {
+    return await processFileRequest(c, filename, HttpMethod.HEAD)
+  } catch (error) {
+    handleFileError(error, filename)
+  }
 })
 
 export default files

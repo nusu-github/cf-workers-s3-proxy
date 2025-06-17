@@ -22,9 +22,35 @@ const batchDeleteSchema = z.object({
   keys: z
     .array(z.string().min(1, "Key cannot be empty"))
     .min(1, "Keys array cannot be empty")
-    .max(1000, "Maximum 1000 keys allowed"),
+    .max(1000, "Maximum 1000 keys allowed")
+    .refine((keys) => keys.every((key) => isValidFilename(key)), {
+      message:
+        "One or more keys contain invalid characters or path traversal attempts",
+    }),
   quiet: z.boolean().optional().default(false),
 })
+
+// ─────────────────────────────────────── Validation Helper Functions ───────────────────────────────────────
+/**
+ * Validates filename for security issues like path traversal
+ */
+function isValidFilename(filename: string): boolean {
+  if (!filename || filename.trim() === "") return false
+
+  // Check for path traversal
+  if (filename.includes("..") || filename.match(/%2e|%2f/i)) return false
+
+  // Check for Windows-style path separators
+  if (filename.includes("\\")) return false
+
+  // Check for absolute paths
+  if (filename.startsWith("/")) return false
+
+  // Check for invalid path format
+  if (filename.includes("//") || filename.endsWith("/")) return false
+
+  return true
+}
 
 // ─────────────────────────────────────── Auth Helper Functions ───────────────────────────────────────
 async function enforceUrlSigning(
@@ -64,7 +90,7 @@ async function handleS3ResponseError(
 ): Promise<void> {
   let errorDetails = ""
   try {
-    errorDetails = await response.text()
+    errorDetails = await response.clone().text()
   } catch (readError) {
     console.error("Failed to read error response:", readError)
   }
@@ -72,7 +98,13 @@ async function handleS3ResponseError(
   const statusMessage = `${response.status} ${response.statusText}`
   const fullMessage = `${context}: ${statusMessage}${errorDetails ? ` - ${errorDetails}` : ""}`
 
-  throw new HTTPException(response.status as ContentfulStatusCode, {
+  // Ensure status code is valid for HTTPException
+  const statusCode =
+    response.status >= 400 && response.status <= 599
+      ? (response.status as ContentfulStatusCode)
+      : (500 as ContentfulStatusCode)
+
+  throw new HTTPException(statusCode, {
     message: fullMessage,
   })
 }
@@ -138,10 +170,7 @@ function createDeleteSuccessResponse(filename: string) {
   }
 }
 
-function createBatchDeleteSuccessResponse(
-  keyCount: number,
-  _uploadId?: string,
-) {
+function createBatchDeleteSuccessResponse(keyCount: number) {
   return {
     success: true,
     message: `Batch delete initiated for ${keyCount} objects`,
@@ -238,7 +267,9 @@ deleteRoute.post(
       }
 
       if (!quiet) {
-        const responseText = await response.clone().text()
+        // Clone response before reading to avoid double-read issues
+        const clonedResponse = response.clone()
+        const responseText = await clonedResponse.text()
         return new Response(responseText, {
           status: response.status,
           headers: response.headers,

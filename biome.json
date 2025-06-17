@@ -19,7 +19,11 @@
     "indentStyle": "space"
   },
   "files": {
-    "ignore": ["worker-configuration.d.ts", ".wrangler/**/*.js"]
+    "ignore": [
+      "worker-configuration.d.ts",
+      ".wrangler/**/*.js",
+      ".claude/settings.local.json"
+    ]
   },
   "javascript": {
     "formatter": {
