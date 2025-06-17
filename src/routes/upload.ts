@@ -44,25 +44,6 @@ const presignedUploadSchema = z.object({
     .default({}),
 })
 
-const _completeMultipartUploadSchema = z.object({
-  parts: z
-    .array(
-      z.object({
-        partNumber: z
-          .number()
-          .int()
-          .min(MULTIPART_PART_LIMITS.MIN_PART_NUMBER)
-          .max(MULTIPART_PART_LIMITS.MAX_PART_NUMBER),
-        etag: z.string().min(1, "ETag cannot be empty"),
-      }),
-    )
-    .min(1, "At least one part is required")
-    .max(
-      MULTIPART_PART_LIMITS.MAX_PARTS,
-      `Maximum ${MULTIPART_PART_LIMITS.MAX_PARTS} parts allowed`,
-    ),
-})
-
 // ─────────────────────────────────────── Auth Helper Functions ───────────────────────────────────────
 async function enforceUrlSigning(
   env: Env,

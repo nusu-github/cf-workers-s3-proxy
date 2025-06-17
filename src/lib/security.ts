@@ -148,8 +148,8 @@ function validateNoPathTraversal(prefix: string): void {
  */
 function sanitizeAndValidateCharacters(prefix: string): string {
   // Remove control characters (0x00-0x1F, 0x7F) and other problematic characters
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: Unicode ranges needed for security validation
   const withoutControlChars = prefix.replace(
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: Unicode ranges needed for security validation
     /[\u0000-\u001F\u007F\u0080-\u009F]/g,
     "",
   )

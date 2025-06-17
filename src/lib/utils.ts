@@ -117,8 +117,8 @@ function removeProblematicCharacters(filename: string): string {
   let sanitizedFilename = filename.replace(/[^a-zA-Z0-9._\-\s]/g, "")
 
   // Strip control characters (including Unicode control characters)
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: Unicode ranges needed for security validation
   sanitizedFilename = sanitizedFilename.replace(
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: Unicode ranges needed for security validation
     /[\u0000-\u001F\u007F\u0080-\u009F]/g,
     "",
   )
@@ -180,7 +180,8 @@ function isWindowsReservedName(filename: string): boolean {
     "LPT9",
   ]
   const nameParts = filename.split(".")
-  const filenameWithoutExtension = nameParts.length > 0 ? nameParts[0]?.toUpperCase() ?? "" : ""
+  const filenameWithoutExtension =
+    nameParts.length > 0 ? (nameParts[0]?.toUpperCase() ?? "") : ""
   return windowsReservedNames.includes(filenameWithoutExtension)
 }
 

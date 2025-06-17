@@ -63,7 +63,7 @@ function mapS3ErrorToHttpStatus(errorCode: string): ContentfulStatusCode {
   )
 }
 
-function sanitizeErrorMessage(errorCode: string, errorMessage: string): string {
+function sanitizeErrorMessage(errorCode: string): string {
   // Map known S3 error codes to safe user messages
   const safeErrorMessages: Record<string, string> = {
     NoSuchBucket: "Bucket not found",
@@ -90,7 +90,7 @@ function handleS3Error(parsedXml: S3ErrorResponse): never {
   })
 
   const statusCode = mapS3ErrorToHttpStatus(s3Error.Code)
-  const safeMessage = sanitizeErrorMessage(s3Error.Code, s3Error.Message)
+  const safeMessage = sanitizeErrorMessage(s3Error.Code)
 
   throw new HTTPException(statusCode, {
     message: safeMessage,

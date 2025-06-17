@@ -144,7 +144,7 @@ async function validateUrlSignatureAuth(
   }
 }
 
-function throwAuthError(endpoint: string, _hasAuthHeader: boolean): never {
+function throwAuthError(endpoint: string): never {
   // Log minimal information for security
   console.error("Cache operation authentication failed for endpoint:", endpoint)
   throw new HTTPException(HTTP_STATUS.FORBIDDEN, {
@@ -174,7 +174,7 @@ async function validateCacheAuth(
   if (urlResult.authenticated) return
 
   // No valid authentication found
-  throwAuthError(endpoint, !!c.req.header("authorization"))
+  throwAuthError(endpoint)
 }
 
 // ─────────────────────────────────────── Purge Helper Functions ───────────────────────────────────────
