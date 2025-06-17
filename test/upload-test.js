@@ -341,6 +341,290 @@ class UploadTestSuite {
   }
 
   /**
+   * Test 7: Complete multipart upload workflow
+   */
+  async testCompleteMultipartUpload() {
+    const filename = `test-multipart-complete-${Date.now()}.dat`
+    const partSize = 6 * 1024 * 1024 // 6MB per part (above minimum)
+    const numParts = 3
+    const totalSize = partSize * numParts
+
+    this.uploadedFiles.push(filename)
+
+    // Step 1: Initiate multipart upload
+    const initiateUrl = await generateSignedUrl(
+      `${CONFIG.BASE_URL}/${filename}/uploads`,
+    )
+
+    const initiateResponse = await fetch(initiateUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "x-amz-meta-test": "complete-multipart",
+      },
+    })
+
+    if (!initiateResponse.ok) {
+      const errorText = await initiateResponse.text()
+      throw new Error(
+        `Multipart initiation failed: ${initiateResponse.status} ${initiateResponse.statusText} - ${errorText}`,
+      )
+    }
+
+    const initiateResponseText = await initiateResponse.text()
+    const uploadIdMatch = initiateResponseText.match(
+      /<UploadId>([^<]+)<\/UploadId>/,
+    )
+    if (!uploadIdMatch) {
+      throw new Error("Could not extract UploadId from initiation response")
+    }
+
+    const uploadId = uploadIdMatch[1]
+    console.log(`   🔄 Initiated multipart upload with ID: ${uploadId}`)
+
+    // Step 2: Upload parts
+    const parts = []
+    const testData = generateTestFile(totalSize)
+
+    for (let partNumber = 1; partNumber <= numParts; partNumber++) {
+      const startByte = (partNumber - 1) * partSize
+      const endByte = partNumber === numParts ? totalSize : startByte + partSize
+      const partData = testData.slice(startByte, endByte)
+
+      const partUrl = await generateSignedUrl(
+        `${CONFIG.BASE_URL}/${filename}?partNumber=${partNumber}&uploadId=${encodeURIComponent(uploadId)}`,
+      )
+
+      const partResponse = await fetch(partUrl, {
+        method: "PUT",
+        headers: {
+          "Content-Length": partData.length.toString(),
+          "Content-MD5": calculateMD5(partData),
+        },
+        body: partData,
+      })
+
+      if (!partResponse.ok) {
+        const errorText = await partResponse.text()
+        throw new Error(
+          `Part ${partNumber} upload failed: ${partResponse.status} ${partResponse.statusText} - ${errorText}`,
+        )
+      }
+
+      const etag = partResponse.headers.get("ETag")
+      if (!etag) {
+        throw new Error(`Part ${partNumber} response missing ETag header`)
+      }
+
+      parts.push({ partNumber, etag: etag.replace(/"/g, "") }) // Remove quotes from ETag
+      console.log(
+        `   📦 Uploaded part ${partNumber}/${numParts} (${partData.length} bytes)`,
+      )
+    }
+
+    // Step 3: Complete multipart upload
+    const completeXml = this.generateCompleteMultipartXml(parts)
+    const completeUrl = await generateSignedUrl(
+      `${CONFIG.BASE_URL}/${filename}?uploadId=${encodeURIComponent(uploadId)}`,
+    )
+
+    const completeResponse = await fetch(completeUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/xml",
+        "Content-Length": completeXml.length.toString(),
+      },
+      body: completeXml,
+    })
+
+    if (!completeResponse.ok) {
+      const errorText = await completeResponse.text()
+      throw new Error(
+        `Multipart completion failed: ${completeResponse.status} ${completeResponse.statusText} - ${errorText}`,
+      )
+    }
+
+    console.log(`   ✅ Multipart upload completed for: ${filename}`)
+    console.log(`   📊 Total size: ${totalSize} bytes in ${numParts} parts`)
+
+    // Step 4: Verify the completed upload
+    await sleep(2000) // Wait for S3 consistency
+    await this.verifyFileExists(filename, testData)
+  }
+
+  /**
+   * Test 8: Multipart upload with invalid completion XML
+   */
+  async testMultipartUploadInvalidCompletion() {
+    const filename = `test-multipart-invalid-${Date.now()}.dat`
+
+    this.uploadedFiles.push(filename)
+
+    // Step 1: Initiate multipart upload
+    const initiateUrl = await generateSignedUrl(
+      `${CONFIG.BASE_URL}/${filename}/uploads`,
+    )
+
+    const initiateResponse = await fetch(initiateUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+      },
+    })
+
+    if (!initiateResponse.ok) {
+      const errorText = await initiateResponse.text()
+      throw new Error(
+        `Multipart initiation failed: ${initiateResponse.status} ${initiateResponse.statusText} - ${errorText}`,
+      )
+    }
+
+    const initiateResponseText = await initiateResponse.text()
+    const uploadIdMatch = initiateResponseText.match(
+      /<UploadId>([^<]+)<\/UploadId>/,
+    )
+    if (!uploadIdMatch) {
+      throw new Error("Could not extract UploadId from initiation response")
+    }
+
+    const uploadId = uploadIdMatch[1]
+
+    // Step 2: Try to complete with invalid XML
+    const invalidXml = "<InvalidXML></InvalidXML>"
+    const completeUrl = await generateSignedUrl(
+      `${CONFIG.BASE_URL}/${filename}?uploadId=${encodeURIComponent(uploadId)}`,
+    )
+
+    const completeResponse = await fetch(completeUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/xml",
+        "Content-Length": invalidXml.length.toString(),
+      },
+      body: invalidXml,
+    })
+
+    if (completeResponse.ok) {
+      throw new Error(
+        "Expected error for invalid completion XML, but got success",
+      )
+    }
+
+    console.log(
+      `   ✅ Invalid completion XML correctly rejected (${completeResponse.status})`,
+    )
+
+    // Step 3: Try to complete with empty body
+    const emptyResponse = await fetch(completeUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/xml",
+        "Content-Length": "0",
+      },
+      body: "",
+    })
+
+    if (emptyResponse.ok) {
+      throw new Error(
+        "Expected error for empty completion body, but got success",
+      )
+    }
+
+    console.log(
+      `   ✅ Empty completion body correctly rejected (${emptyResponse.status})`,
+    )
+
+    // Clean up by aborting the multipart upload
+    await this.abortMultipartUpload(filename, uploadId)
+  }
+
+  /**
+   * Test 9: Multipart upload abort
+   */
+  async testMultipartUploadAbort() {
+    const filename = `test-multipart-abort-${Date.now()}.dat`
+
+    this.uploadedFiles.push(filename)
+
+    // Step 1: Initiate multipart upload
+    const initiateUrl = await generateSignedUrl(
+      `${CONFIG.BASE_URL}/${filename}/uploads`,
+    )
+
+    const initiateResponse = await fetch(initiateUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+      },
+    })
+
+    if (!initiateResponse.ok) {
+      const errorText = await initiateResponse.text()
+      throw new Error(
+        `Multipart initiation failed: ${initiateResponse.status} ${initiateResponse.statusText} - ${errorText}`,
+      )
+    }
+
+    const initiateResponseText = await initiateResponse.text()
+    const uploadIdMatch = initiateResponseText.match(
+      /<UploadId>([^<]+)<\/UploadId>/,
+    )
+    if (!uploadIdMatch) {
+      throw new Error("Could not extract UploadId from initiation response")
+    }
+
+    const uploadId = uploadIdMatch[1]
+    console.log(`   🔄 Initiated multipart upload for abort test: ${uploadId}`)
+
+    // Step 2: Upload one part
+    const partData = generateTestFile(6 * 1024 * 1024) // 6MB
+    const partUrl = await generateSignedUrl(
+      `${CONFIG.BASE_URL}/${filename}?partNumber=1&uploadId=${encodeURIComponent(uploadId)}`,
+    )
+
+    const partResponse = await fetch(partUrl, {
+      method: "PUT",
+      headers: {
+        "Content-Length": partData.length.toString(),
+      },
+      body: partData,
+    })
+
+    if (!partResponse.ok) {
+      const errorText = await partResponse.text()
+      throw new Error(
+        `Part upload failed: ${partResponse.status} ${partResponse.statusText} - ${errorText}`,
+      )
+    }
+
+    console.log("   📦 Uploaded part for abort test")
+
+    // Step 3: Abort the multipart upload
+    const abortUrl = await generateSignedUrl(
+      `${CONFIG.BASE_URL}/${filename}?uploadId=${encodeURIComponent(uploadId)}`,
+    )
+
+    const abortResponse = await fetch(abortUrl, {
+      method: "DELETE",
+    })
+
+    if (!abortResponse.ok) {
+      const errorText = await abortResponse.text()
+      throw new Error(
+        `Multipart abort failed: ${abortResponse.status} ${abortResponse.statusText} - ${errorText}`,
+      )
+    }
+
+    const abortResult = await abortResponse.json()
+    console.log("   🗑️  Multipart upload aborted successfully")
+    console.log("   📋 Abort response:", abortResult)
+
+    if (!abortResult.success || abortResult.uploadId !== uploadId) {
+      throw new Error("Abort response format is incorrect")
+    }
+  }
+
+  /**
    * Test 5: Upload with range/streaming (large file simulation)
    */
   async testLargeFileUpload() {
@@ -510,6 +794,15 @@ class UploadTestSuite {
     await this.runTest("Multipart Upload Initiation", () =>
       this.testMultipartUploadInitiation(),
     )
+    await this.runTest("Complete Multipart Upload", () =>
+      this.testCompleteMultipartUpload(),
+    )
+    await this.runTest("Invalid Multipart Completion", () =>
+      this.testMultipartUploadInvalidCompletion(),
+    )
+    await this.runTest("Multipart Upload Abort", () =>
+      this.testMultipartUploadAbort(),
+    )
     await this.runTest("Large File Upload", () => this.testLargeFileUpload())
     await this.runTest("Error Case Handling", () => this.testErrorCases())
 
@@ -518,6 +811,51 @@ class UploadTestSuite {
 
     // Print summary
     this.printSummary(cleanupResults)
+  }
+
+  /**
+   * Generate XML for completing multipart upload
+   */
+  generateCompleteMultipartXml(parts) {
+    const partsXml = parts
+      .map(
+        (part) => `    <Part>
+      <PartNumber>${part.partNumber}</PartNumber>
+      <ETag>${part.etag}</ETag>
+    </Part>`,
+      )
+      .join("\n")
+
+    return `<CompleteMultipartUpload>
+${partsXml}
+</CompleteMultipartUpload>`
+  }
+
+  /**
+   * Helper to abort multipart upload
+   */
+  async abortMultipartUpload(filename, uploadId) {
+    try {
+      const abortUrl = await generateSignedUrl(
+        `${CONFIG.BASE_URL}/${filename}?uploadId=${encodeURIComponent(uploadId)}`,
+      )
+
+      const abortResponse = await fetch(abortUrl, {
+        method: "DELETE",
+      })
+
+      if (abortResponse.ok) {
+        console.log(`   🗑️  Aborted multipart upload: ${uploadId}`)
+      } else {
+        console.log(
+          `   ⚠️  Failed to abort multipart upload: ${uploadId} (${abortResponse.status})`,
+        )
+      }
+    } catch (error) {
+      console.log(
+        `   ❌ Error aborting multipart upload: ${uploadId} - ${error.message}`,
+      )
+    }
   }
 
   /**

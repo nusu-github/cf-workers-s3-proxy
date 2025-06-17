@@ -10,188 +10,238 @@ import { ensureEnvironmentValidated } from "../lib/validation.js"
 import { HttpMethod } from "../types/s3.js"
 import { filenameValidator } from "../validators/filename.js"
 
-const files = new Hono<{ Bindings: Env }>()
+// ─────────────────────────────────────── Constants ───────────────────────────────────────
+const HTTP_STATUS = {
+  NOT_IMPLEMENTED: 501,
+  BAD_GATEWAY: 502,
+} as const
 
-/**
- * Validates URL signing for file access
- */
-function validateFileAccess(
+const CONDITIONAL_HEADERS = {
+  IF_NONE_MATCH: "if-none-match",
+  IF_MODIFIED_SINCE: "if-modified-since",
+  RANGE: "range",
+} as const
+
+// ─────────────────────────────────────── Auth Helper Functions ───────────────────────────────────────
+async function enforceUrlSigning(
   env: Env,
   pathname: string,
   requestUrl: string,
 ): Promise<void> {
-  if (shouldEnforceUrlSigning(env, pathname)) {
-    if (!env.URL_SIGNING_SECRET) {
-      throw new HTTPException(501, {
-        message: "URL signing is required but not configured",
-      })
-    }
-    return verifySignature(new URL(requestUrl), env.URL_SIGNING_SECRET)
+  if (!shouldEnforceUrlSigning(env, pathname)) return
+
+  if (!env.URL_SIGNING_SECRET) {
+    throw new HTTPException(HTTP_STATUS.NOT_IMPLEMENTED, {
+      message: "URL signing is required but not configured",
+    })
   }
-  return Promise.resolve()
+
+  await verifySignature(new URL(requestUrl), env.URL_SIGNING_SECRET)
 }
 
-/**
- * Builds request headers for S3 fetch
- */
+// ─────────────────────────────────────── Header Helper Functions ───────────────────────────────────────
+function extractConditionalHeaders(headers: Headers) {
+  return {
+    ifNoneMatch: headers.get(CONDITIONAL_HEADERS.IF_NONE_MATCH),
+    ifModifiedSince: headers.get(CONDITIONAL_HEADERS.IF_MODIFIED_SINCE),
+    range: headers.get(CONDITIONAL_HEADERS.RANGE),
+  }
+}
+
 function buildRequestHeaders(c: Context<{ Bindings: Env }>): Headers {
   const headers = new Headers()
+  const { ifNoneMatch, ifModifiedSince, range } = extractConditionalHeaders(
+    c.req.raw.headers,
+  )
 
-  // Enhanced header handling
-  const rangeHeader = c.req.header("range")
-  if (rangeHeader) {
-    headers.set("Range", rangeHeader)
-  }
-
-  // Forward conditional headers for cache efficiency and reduced data transfer
-  const ifNoneMatch = c.req.header("if-none-match")
-  const ifModifiedSince = c.req.header("if-modified-since")
-  if (ifNoneMatch) {
-    headers.set("If-None-Match", ifNoneMatch)
-  }
-  if (ifModifiedSince) {
-    headers.set("If-Modified-Since", ifModifiedSince)
-  }
+  if (range) headers.set("Range", range)
+  if (ifNoneMatch) headers.set("If-None-Match", ifNoneMatch)
+  if (ifModifiedSince) headers.set("If-Modified-Since", ifModifiedSince)
 
   return headers
 }
 
-/**
- * Handles download disposition headers
- */
-function handleDownloadDisposition(
+function determineContentDisposition(
   c: Context<{ Bindings: Env }>,
-  method: HttpMethod,
   filename: string,
+): string | null {
+  const downloadParam = c.req.query("download")
+  const inlineParam = c.req.query("inline")
+
+  if (downloadParam !== undefined) {
+    const defaultName = filename.split("/").pop() || "download"
+    const requestedName = downloadParam || defaultName
+    const sanitizedName = sanitizeDownloadFilename(requestedName, defaultName)
+    return `attachment; filename="${sanitizedName}"`
+  }
+
+  if (inlineParam !== undefined) {
+    return "inline"
+  }
+
+  return null
+}
+
+function addContentDisposition(
   headers: Headers,
+  disposition: string | null,
 ): void {
-  if (method === HttpMethod.GET) {
-    if (c.req.query("download") !== undefined) {
-      const defaultName = filename.split("/").pop() || "download"
-      const dlName = c.req.query("download") || defaultName
-      const sanitizedName = sanitizeDownloadFilename(dlName, defaultName)
-      headers.set(
-        "Content-Disposition",
-        `attachment; filename="${sanitizedName}"`,
-      )
-    } else if (c.req.query("inline") !== undefined) {
-      headers.set("Content-Disposition", "inline")
-    }
+  if (disposition) {
+    headers.set("Content-Disposition", disposition)
   }
 }
 
-/**
- * Logs conditional request headers for debugging
- */
-function logConditionalHeaders(
+// ─────────────────────────────────────── Debug Helper Functions ───────────────────────────────────────
+function logConditionalRequest(
   config: ReturnType<typeof getCacheConfig>,
-  ifNoneMatch: string | undefined,
-  ifModifiedSince: string | undefined,
+  conditionalHeaders: ReturnType<typeof extractConditionalHeaders>,
 ): void {
-  if (config.debug) {
-    const conditionalHeaders = []
-    if (ifNoneMatch) conditionalHeaders.push(`If-None-Match: ${ifNoneMatch}`)
-    if (ifModifiedSince)
-      conditionalHeaders.push(`If-Modified-Since: ${ifModifiedSince}`)
-    if (conditionalHeaders.length > 0) {
-      console.log(
-        `Processing conditional request with headers: ${conditionalHeaders.join(", ")}`,
-      )
-    }
+  if (!config.debug) return
+
+  const { ifNoneMatch, ifModifiedSince } = conditionalHeaders
+  const logEntries = []
+
+  if (ifNoneMatch) logEntries.push(`If-None-Match: ${ifNoneMatch}`)
+  if (ifModifiedSince) logEntries.push(`If-Modified-Since: ${ifModifiedSince}`)
+
+  if (logEntries.length > 0) {
+    console.log(
+      `Processing conditional request with headers: ${logEntries.join(", ")}`,
+    )
   }
 }
 
-/**
- * Enhances response with debug headers
- */
-function enhanceResponse(
+function addDebugHeaders(
   response: Response,
   config: ReturnType<typeof getCacheConfig>,
   cacheResult: Awaited<ReturnType<typeof cachedS3Fetch>>["cacheResult"],
-  version: string | undefined,
-): Response {
-  // Check if we need to add any headers
-  const shouldIncludeDebugHeader = config.debug && cacheResult
-  const shouldIncludeVersionHeader = true // Always add version header
-
-  if (shouldIncludeDebugHeader || shouldIncludeVersionHeader) {
-    // Create new response with mutable headers to avoid immutable header errors
-    const enhancedResponse = new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: new Headers(response.headers),
-    })
-
-    // Add headers to the new mutable response
-    if (shouldIncludeDebugHeader) {
-      enhancedResponse.headers.set("X-Cache-Debug", JSON.stringify(cacheResult))
-    }
-    if (shouldIncludeVersionHeader) {
-      enhancedResponse.headers.set("X-Proxy-Version", version || "dev")
-    }
-
-    return enhancedResponse
+): void {
+  if (config.debug && cacheResult) {
+    response.headers.set("X-Cache-Debug", JSON.stringify(cacheResult))
   }
-
-  return response
 }
 
-// Enhanced handler for GET requests with better Hono features
+function addVersionHeader(response: Response, version?: string): void {
+  response.headers.set("X-Proxy-Version", version || "dev")
+}
+
+// ─────────────────────────────────────── Response Helper Functions ───────────────────────────────────────
+function shouldEnhanceResponse(
+  config: ReturnType<typeof getCacheConfig>,
+  cacheResult: Awaited<ReturnType<typeof cachedS3Fetch>>["cacheResult"],
+): boolean {
+  return config.debug || !!cacheResult
+}
+
+function createEnhancedResponse(
+  originalResponse: Response,
+  config: ReturnType<typeof getCacheConfig>,
+  cacheResult: Awaited<ReturnType<typeof cachedS3Fetch>>["cacheResult"],
+  version?: string,
+): Response {
+  const enhancedResponse = new Response(originalResponse.body, {
+    status: originalResponse.status,
+    statusText: originalResponse.statusText,
+    headers: new Headers(originalResponse.headers),
+  })
+
+  addDebugHeaders(enhancedResponse, config, cacheResult)
+  addVersionHeader(enhancedResponse, version)
+
+  return enhancedResponse
+}
+
+function enhanceResponseIfNeeded(
+  response: Response,
+  config: ReturnType<typeof getCacheConfig>,
+  cacheResult: Awaited<ReturnType<typeof cachedS3Fetch>>["cacheResult"],
+  version?: string,
+): Response {
+  if (!shouldEnhanceResponse(config, cacheResult)) {
+    return response
+  }
+
+  return createEnhancedResponse(response, config, cacheResult, version)
+}
+
+// ─────────────────────────────────────── Error Helper Functions ───────────────────────────────────────
+function handleFileError(error: unknown, filename: string): never {
+  console.error(`File retrieval error for ${filename}:`, error)
+
+  if (error instanceof HTTPException) {
+    throw error
+  }
+
+  const message = error instanceof Error ? error.message : "Unknown error"
+  throw new HTTPException(HTTP_STATUS.BAD_GATEWAY, {
+    message: `Failed to retrieve file: ${message}`,
+  })
+}
+
+// ─────────────────────────────────────── Core File Functions ───────────────────────────────────────
+async function processFileRequest(
+  c: Context<{ Bindings: Env }>,
+  filename: string,
+  method: HttpMethod,
+): Promise<Response> {
+  const signer = getAwsClient(c.env)
+  const url = `${getS3BaseUrl(c.env)}/${filename}`
+  const config = getCacheConfig(c.env)
+
+  // Build request headers
+  const headers = buildRequestHeaders(c)
+  const conditionalHeaders = extractConditionalHeaders(c.req.raw.headers)
+
+  // Handle content disposition for GET requests
+  if (method === HttpMethod.GET) {
+    const disposition = determineContentDisposition(c, filename)
+    addContentDisposition(headers, disposition)
+  }
+
+  // Debug logging
+  logConditionalRequest(config, conditionalHeaders)
+
+  // Execute S3 request
+  const retryAttempts = parseInteger(
+    c.env.RANGE_RETRY_ATTEMPTS,
+    "RANGE_RETRY_ATTEMPTS",
+  )
+  const { response, cacheResult } = await cachedS3Fetch(
+    signer,
+    url,
+    method,
+    headers,
+    retryAttempts,
+    c.env,
+    c.req.raw,
+  )
+
+  // Enhance response if needed
+  return enhanceResponseIfNeeded(response, config, cacheResult, c.env.VERSION)
+}
+
+// ─────────────────────────────────────── Router Instance ───────────────────────────────────────
+const files = new Hono<{ Bindings: Env }>()
+
+// ─────────────────────────────────────── Route Handlers ───────────────────────────────────────
 files.get("/:filename{.*}", filenameValidator, async (c) => {
-  // Ensure environment is validated (fail-fast behavior)
   ensureEnvironmentValidated(c.env)
 
   const validatedData = c.req.valid("param") as { filename: string }
   const filename = validatedData.filename
 
-  // Security: Enhanced URL signing enforcement
-  const pathname = `/${filename}`
-  await validateFileAccess(c.env, pathname, c.req.url)
-
-  const method = c.req.raw.method as HttpMethod
-  const signer = getAwsClient(c.env)
-  const url = `${getS3BaseUrl(c.env)}/${filename}`
-
-  // Build request headers
-  const headers = buildRequestHeaders(c)
-
-  // Handle download disposition
-  handleDownloadDisposition(c, method, filename, headers)
-
-  // Debug logging for conditional requests
-  const config = getCacheConfig(c.env)
-  const ifNoneMatch = c.req.header("if-none-match")
-  const ifModifiedSince = c.req.header("if-modified-since")
-  logConditionalHeaders(config, ifNoneMatch, ifModifiedSince)
+  await enforceUrlSigning(c.env, `/${filename}`, c.req.url)
 
   try {
-    const { response, cacheResult } = await cachedS3Fetch(
-      signer,
-      url,
-      method,
-      headers,
-      parseInteger(c.env.RANGE_RETRY_ATTEMPTS, "RANGE_RETRY_ATTEMPTS"),
-      c.env,
-      c.req.raw,
-    )
-
-    return enhanceResponse(response, config, cacheResult, c.env.VERSION)
+    const method = c.req.raw.method as HttpMethod
+    return await processFileRequest(c, filename, method)
   } catch (error) {
-    console.error(`File retrieval error for ${filename}:`, error)
-
-    if (error instanceof HTTPException) {
-      throw error
-    }
-
-    throw new HTTPException(502, {
-      message: `Failed to retrieve file: ${error instanceof Error ? error.message : "Unknown error"}`,
-    })
+    handleFileError(error, filename)
   }
 })
 
-// HEAD request handler for file metadata
 files.on("HEAD", "/:filename{.*}", filenameValidator, async (c) => {
-  // Use the same logic as GET but with HEAD method
+  // Reuse GET logic with HEAD method
   return files.fetch(
     new Request(c.req.url, { method: "GET", headers: c.req.raw.headers }),
     c.env,

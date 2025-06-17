@@ -18,30 +18,15 @@ import { filenameValidator } from "../validators/filename.js"
 const MULTIPART_PART_LIMITS = {
   MIN_PART_NUMBER: 1,
   MAX_PART_NUMBER: 10000,
+  MIN_PART_SIZE: 5 * 1024 * 1024, // 5MB minimum (except last part)
+  MAX_PARTS: 10000,
+  MAX_MULTIPART_UPLOAD_SIZE: 5 * 1024 * 1024 * 1024 * 1024, // 5TB
 } as const
 
 const HTTP_STATUS = {
   BAD_REQUEST: 400,
   NOT_IMPLEMENTED: 501,
   BAD_GATEWAY: 502,
-} as const
-
-const HEADER_GROUPS = {
-  CONTENT: [
-    "content-type",
-    "content-md5",
-    "content-length",
-    "content-encoding",
-    "cache-control",
-  ],
-  SSE: [
-    "x-amz-server-side-encryption",
-    "x-amz-server-side-encryption-aws-kms-key-id",
-    "x-amz-server-side-encryption-context",
-    "x-amz-server-side-encryption-customer-algorithm",
-    "x-amz-server-side-encryption-customer-key",
-    "x-amz-server-side-encryption-customer-key-md5",
-  ],
 } as const
 
 // ─────────────────────────────────────── Schemas ───────────────────────────────────────
@@ -59,27 +44,32 @@ const presignedUploadSchema = z.object({
     .default({}),
 })
 
-// ─────────────────────────────────────── Router Instance ───────────────────────────────────────
-const upload = new Hono<{ Bindings: Env }>()
+const _completeMultipartUploadSchema = z.object({
+  parts: z
+    .array(
+      z.object({
+        partNumber: z
+          .number()
+          .int()
+          .min(MULTIPART_PART_LIMITS.MIN_PART_NUMBER)
+          .max(MULTIPART_PART_LIMITS.MAX_PART_NUMBER),
+        etag: z.string().min(1, "ETag cannot be empty"),
+      }),
+    )
+    .min(1, "At least one part is required")
+    .max(
+      MULTIPART_PART_LIMITS.MAX_PARTS,
+      `Maximum ${MULTIPART_PART_LIMITS.MAX_PARTS} parts allowed`,
+    ),
+})
 
-// ─────────────────────────────────────── Helper Functions ───────────────────────────────────────
-/**
- * Validates and enforces URL signing authentication
- * Consolidates the authentication logic to eliminate code duplication
- *
- * @param env - Environment configuration
- * @param pathname - Path to validate signing for
- * @param requestUrl - Full request URL for signature verification
- * @throws HTTPException if URL signing is required but not configured or invalid
- */
+// ─────────────────────────────────────── Auth Helper Functions ───────────────────────────────────────
 async function enforceUrlSigning(
   env: Env,
   pathname: string,
   requestUrl: string,
 ): Promise<void> {
-  if (!shouldEnforceUrlSigning(env, pathname)) {
-    return // URL signing not required
-  }
+  if (!shouldEnforceUrlSigning(env, pathname)) return
 
   if (!env.URL_SIGNING_SECRET) {
     throw new HTTPException(HTTP_STATUS.NOT_IMPLEMENTED, {
@@ -90,13 +80,7 @@ async function enforceUrlSigning(
   await verifySignature(new URL(requestUrl), env.URL_SIGNING_SECRET)
 }
 
-/**
- * Validates multipart upload part number
- *
- * @param partNumber - Part number as string
- * @returns Validated part number as integer
- * @throws HTTPException if part number is invalid
- */
+// ─────────────────────────────────────── Validation Helper Functions ───────────────────────────────────────
 function validatePartNumber(partNumber: string): number {
   const partNum = Number.parseInt(partNumber, 10)
   const isValidPartNumber =
@@ -113,131 +97,219 @@ function validatePartNumber(partNumber: string): number {
   return partNum
 }
 
-/**
- * Forwards relevant S3 headers from the incoming request
- * Organized by header groups for better maintainability
- */
-function forwardS3Headers(sourceHeaders: Headers): Headers {
-  const headers = new Headers()
-
-  // Forward content headers
-  for (const headerName of HEADER_GROUPS.CONTENT) {
-    const value = sourceHeaders.get(headerName)
-    if (value) {
-      headers.set(headerName, value)
-    }
+function validateRequestBody(
+  body: ReadableStream | null,
+  context: string,
+): ReadableStream {
+  if (!body) {
+    throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
+      message: `Request body is required for ${context}`,
+    })
   }
-
-  // Forward SSE headers
-  for (const headerName of HEADER_GROUPS.SSE) {
-    const value = sourceHeaders.get(headerName)
-    if (value) {
-      headers.set(headerName, value)
-    }
-  }
-
-  // Forward S3 metadata headers (x-amz-meta-*)
-  for (const [name, value] of sourceHeaders.entries()) {
-    if (name.toLowerCase().startsWith("x-amz-meta-")) {
-      headers.set(name, value)
-    }
-  }
-
-  // Forward S3 checksum headers (x-amz-checksum-*)
-  for (const [name, value] of sourceHeaders.entries()) {
-    if (name.toLowerCase().startsWith("x-amz-checksum-")) {
-      headers.set(name, value)
-    }
-  }
-
-  return headers
+  return body
 }
 
-/**
- * Handles upload errors consistently with improved error context
- * Enhanced for better debugging and testability
- */
-function handleUploadError(error: unknown, context: string): never {
-  // Log error for debugging (can be mocked in tests)
-  console.error(`${context}:`, error)
-
-  if (error instanceof HTTPException) {
-    throw error
+function validateUploadId(
+  uploadId: string | undefined,
+  context: string,
+): string {
+  if (!uploadId) {
+    throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
+      message: `Invalid request. For ${context}, uploadId is required`,
+    })
   }
+  return uploadId
+}
 
-  if (error instanceof Error) {
-    throw new HTTPException(HTTP_STATUS.BAD_GATEWAY, {
-      message: `${context}: ${error.message}`,
+function validatePartSize(
+  contentLength: string | undefined,
+  partNumber: number,
+  isLastPart = false,
+): number {
+  if (!contentLength) {
+    throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
+      message: "Content-Length header is required for multipart uploads",
     })
   }
 
-  throw new HTTPException(HTTP_STATUS.BAD_GATEWAY, {
-    message: `${context}: Unknown error occurred`,
-  })
+  const size = Number.parseInt(contentLength, 10)
+  if (Number.isNaN(size) || size < 0) {
+    throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
+      message: "Invalid Content-Length value",
+    })
+  }
+
+  // S3 requires minimum 5MB per part (except the last part)
+  if (!isLastPart && size < MULTIPART_PART_LIMITS.MIN_PART_SIZE) {
+    throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
+      message: `Part ${partNumber} is too small. Minimum size is ${MULTIPART_PART_LIMITS.MIN_PART_SIZE} bytes (except for the last part)`,
+    })
+  }
+
+  return size
 }
 
-/**
- * Enhanced error handling for S3 responses with detailed error information
- */
-async function handleS3ResponseError(
-  response: Response,
-  context: string,
-): Promise<void> {
-  let errorDetails = ""
+async function validateMultipartCompletionXML(body: ReadableStream): Promise<{
+  xml: string
+  parsedParts: Array<{ partNumber: number; etag: string }>
+}> {
+  const reader = body.getReader()
+  const chunks: Uint8Array[] = []
+  let totalSize = 0
+  const maxXmlSize = 1024 * 1024 // 1MB limit for XML
+
   try {
-    errorDetails = await response.text()
-  } catch (readError) {
-    console.error("Failed to read error response:", readError)
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      totalSize += value.length
+      if (totalSize > maxXmlSize) {
+        throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
+          message: "Multipart completion XML is too large",
+        })
+      }
+
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
   }
 
-  const statusMessage = `${response.status} ${response.statusText}`
-  const fullMessage = `${context}: ${statusMessage}${errorDetails ? ` - ${errorDetails}` : ""}`
+  if (totalSize === 0) {
+    throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
+      message: "Multipart completion request body is required",
+    })
+  }
 
-  throw new HTTPException(response.status as ContentfulStatusCode, {
-    message: fullMessage,
-  })
+  const xmlBuffer = new Uint8Array(totalSize)
+  let offset = 0
+  for (const chunk of chunks) {
+    xmlBuffer.set(chunk, offset)
+    offset += chunk.length
+  }
+
+  const xml = new TextDecoder().decode(xmlBuffer)
+
+  // Basic XML validation
+  if (
+    !xml.includes("<CompleteMultipartUpload>") ||
+    !xml.includes("</CompleteMultipartUpload>")
+  ) {
+    throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
+      message: "Invalid XML format. Expected CompleteMultipartUpload structure",
+    })
+  }
+
+  // Extract and validate parts
+  const parsedParts = parseMultipartCompletionXML(xml)
+
+  return { xml, parsedParts }
 }
 
-/**
- * Creates headers for multipart upload part request
- * Extracted for better testability and reusability
- */
-function createPartUploadHeaders(
-  contentLength: string | undefined,
-  contentMd5: string | undefined,
+function parseMultipartCompletionXML(
+  xml: string,
+): Array<{ partNumber: number; etag: string }> {
+  const parts: Array<{ partNumber: number; etag: string }> = []
+
+  // Simple regex-based parsing (more robust than full XML parser for this specific case)
+  const partRegex =
+    /<Part>\s*<PartNumber>(\d+)<\/PartNumber>\s*<ETag>([^<]+)<\/ETag>\s*<\/Part>/g
+
+  let match: RegExpExecArray | null = null
+  // biome-ignore lint/suspicious/noAssignInExpressions: Necessary for regex iteration
+  while ((match = partRegex.exec(xml)) !== null) {
+    const partNumber = Number.parseInt(match[1], 10)
+    const etag = match[2].trim()
+
+    if (
+      Number.isNaN(partNumber) ||
+      partNumber < MULTIPART_PART_LIMITS.MIN_PART_NUMBER ||
+      partNumber > MULTIPART_PART_LIMITS.MAX_PART_NUMBER
+    ) {
+      throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
+        message: `Invalid part number: ${partNumber}`,
+      })
+    }
+
+    if (!etag) {
+      throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
+        message: `Missing ETag for part ${partNumber}`,
+      })
+    }
+
+    // Check for duplicate part numbers
+    if (parts.some((p) => p.partNumber === partNumber)) {
+      throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
+        message: `Duplicate part number: ${partNumber}`,
+      })
+    }
+
+    parts.push({ partNumber, etag })
+  }
+
+  if (parts.length === 0) {
+    throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
+      message: "No valid parts found in completion XML",
+    })
+  }
+
+  if (parts.length > MULTIPART_PART_LIMITS.MAX_PARTS) {
+    throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
+      message: `Too many parts: ${parts.length}. Maximum allowed: ${MULTIPART_PART_LIMITS.MAX_PARTS}`,
+    })
+  }
+
+  // Sort parts by part number and validate sequence
+  parts.sort((a, b) => a.partNumber - b.partNumber)
+
+  // Validate that part numbers are sequential (1, 2, 3, ...)
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i].partNumber !== i + 1) {
+      throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
+        message: `Part numbers must be sequential starting from 1. Missing part ${i + 1}`,
+      })
+    }
+  }
+
+  return parts
+}
+
+// ─────────────────────────────────────── Header Helper Functions ───────────────────────────────────────
+function createBasicHeaders(): Headers {
+  return new Headers()
+}
+
+function addOptionalHeader(
+  headers: Headers,
+  name: string,
+  value?: string,
+): void {
+  if (value) {
+    headers.set(name, value)
+  }
+}
+
+function createUploadHeaders(
+  contentLength?: string,
+  contentMd5?: string,
 ): Headers {
-  const headers = new Headers()
-
-  if (contentLength) {
-    headers.set("Content-Length", contentLength)
-  }
-
-  if (contentMd5) {
-    headers.set("Content-MD5", contentMd5)
-  }
-
+  const headers = createBasicHeaders()
+  addOptionalHeader(headers, "Content-Length", contentLength)
+  addOptionalHeader(headers, "Content-MD5", contentMd5)
   return headers
 }
 
-/**
- * Creates headers for presigned URL generation
- * Consolidates conditional header logic
- */
 function createPresignedUrlHeaders(
   conditions: z.infer<typeof presignedUploadSchema>["conditions"],
 ): Headers {
-  const headers = new Headers()
+  const headers = createBasicHeaders()
 
-  if (conditions.contentType) {
-    headers.set("Content-Type", conditions.contentType)
-  }
+  addOptionalHeader(headers, "Content-Type", conditions.contentType)
+  addOptionalHeader(headers, "Content-MD5", conditions.contentMd5)
 
   if (conditions.contentLength) {
     headers.set("Content-Length", conditions.contentLength.toString())
-  }
-
-  if (conditions.contentMd5) {
-    headers.set("Content-MD5", conditions.contentMd5)
   }
 
   if (conditions.metadata) {
@@ -249,17 +321,11 @@ function createPresignedUrlHeaders(
   return headers
 }
 
-/**
- * Creates headers for multipart upload initiation
- * Extracts metadata and content-type headers
- */
-function createMultipartInitHeaders(sourceHeaders: Headers): Headers {
-  const headers = new Headers()
+function createMultipartHeaders(sourceHeaders: Headers): Headers {
+  const headers = createBasicHeaders()
 
   const contentType = sourceHeaders.get("content-type")
-  if (contentType) {
-    headers.set("Content-Type", contentType)
-  }
+  addOptionalHeader(headers, "Content-Type", contentType ?? undefined)
 
   // Forward S3 metadata headers
   for (const [name, value] of sourceHeaders.entries()) {
@@ -271,27 +337,50 @@ function createMultipartInitHeaders(sourceHeaders: Headers): Headers {
   return headers
 }
 
-/**
- * Creates headers for multipart upload completion
- * Sets XML content type and optional content length
- */
-function createMultipartCompletionHeaders(
-  contentLength: string | undefined,
-): Headers {
-  const headers = new Headers()
+function createXmlHeaders(contentLength?: string): Headers {
+  const headers = createBasicHeaders()
   headers.set("Content-Type", "application/xml")
+  addOptionalHeader(headers, "Content-Length", contentLength)
+  return headers
+}
 
-  if (contentLength) {
-    headers.set("Content-Length", contentLength)
+function forwardS3Headers(sourceHeaders: Headers): Headers {
+  const headers = createBasicHeaders()
+
+  const relevantHeaders = [
+    "content-type",
+    "content-md5",
+    "content-length",
+    "content-encoding",
+    "cache-control",
+    "x-amz-server-side-encryption",
+    "x-amz-server-side-encryption-aws-kms-key-id",
+    "x-amz-server-side-encryption-context",
+    "x-amz-server-side-encryption-customer-algorithm",
+    "x-amz-server-side-encryption-customer-key",
+    "x-amz-server-side-encryption-customer-key-md5",
+  ]
+
+  for (const headerName of relevantHeaders) {
+    const value = sourceHeaders.get(headerName)
+    addOptionalHeader(headers, headerName, value ?? undefined)
+  }
+
+  // Forward S3 metadata and checksum headers
+  for (const [name, value] of sourceHeaders.entries()) {
+    const lowerName = name.toLowerCase()
+    if (
+      lowerName.startsWith("x-amz-meta-") ||
+      lowerName.startsWith("x-amz-checksum-")
+    ) {
+      headers.set(name, value)
+    }
   }
 
   return headers
 }
 
-/**
- * Builds S3 URL for multipart operations
- * Centralized URL construction for consistency
- */
+// ─────────────────────────────────────── URL Helper Functions ───────────────────────────────────────
 function buildMultipartUrl(
   baseUrl: string,
   filename: string,
@@ -322,10 +411,183 @@ function buildMultipartUrl(
   }
 }
 
-/**
- * Handles multipart upload part request
- * Refactored to be more focused and testable
- */
+// ─────────────────────────────────────── Error Helper Functions ───────────────────────────────────────
+function handleUploadError(error: unknown, context: string): never {
+  console.error(`${context}:`, error)
+
+  if (error instanceof HTTPException) {
+    throw error
+  }
+
+  const message =
+    error instanceof Error ? error.message : "Unknown error occurred"
+  throw new HTTPException(HTTP_STATUS.BAD_GATEWAY, {
+    message: `${context}: ${message}`,
+  })
+}
+
+async function handleS3ResponseError(
+  response: Response,
+  context: string,
+): Promise<void> {
+  let errorDetails = ""
+  try {
+    // Clone the response to avoid consuming the body
+    const clonedResponse = response.clone()
+    errorDetails = await clonedResponse.text()
+  } catch (readError) {
+    console.error("Failed to read error response:", readError)
+  }
+
+  const statusMessage = `${response.status} ${response.statusText}`
+
+  // Log detailed error for debugging
+  console.error(`S3 Error - ${context}:`, {
+    status: response.status,
+    statusText: response.statusText,
+    details: errorDetails,
+    headers: Object.fromEntries(response.headers.entries()),
+  })
+
+  // Sanitize error details for client response (avoid leaking sensitive info)
+  const sanitizedDetails =
+    errorDetails.length > 500
+      ? `${errorDetails.substring(0, 500)}...`
+      : errorDetails
+  const fullMessage = `${context}: ${statusMessage}${sanitizedDetails ? ` - ${sanitizedDetails}` : ""}`
+
+  throw new HTTPException(response.status as ContentfulStatusCode, {
+    message: fullMessage,
+  })
+}
+
+// ─────────────────────────────────────── Response Helper Functions ───────────────────────────────────────
+function createPresignedUrlResponse(
+  presignedUrl: string,
+  key: string,
+  expiresIn: number,
+  headers: Headers,
+) {
+  const expirationTimestamp = Math.floor(Date.now() / 1000) + expiresIn
+
+  return {
+    presignedUrl,
+    key,
+    expiresIn,
+    expiresAt: new Date(expirationTimestamp * 1000).toISOString(),
+    method: "PUT",
+    requiredHeaders: Object.fromEntries(headers.entries()),
+  }
+}
+
+function createAbortSuccessResponse(filename: string, uploadId: string) {
+  return {
+    success: true,
+    message: `Multipart upload for '${filename}' aborted successfully`,
+    uploadId,
+    abortedAt: new Date().toISOString(),
+  }
+}
+
+// ─────────────────────────────────────── Core Upload Functions ───────────────────────────────────────
+async function executeSimpleUpload(
+  env: Env,
+  filename: string,
+  body: ReadableStream,
+  sourceHeaders: Headers,
+): Promise<Response> {
+  const signer = getAwsClient(env)
+  const url = `${getS3BaseUrl(env)}/${filename}`
+  const headers = forwardS3Headers(sourceHeaders)
+
+  const signedRequest = await signer.sign(url, {
+    method: HttpMethod.PUT,
+    headers,
+    body,
+  })
+
+  return await fetch(signedRequest)
+}
+
+async function executeMultipartUploadPart(
+  env: Env,
+  filename: string,
+  partNumber: string,
+  uploadId: string,
+  body: ReadableStream,
+  contentLength?: string,
+  contentMd5?: string,
+): Promise<Response> {
+  const signer = getAwsClient(env)
+  const baseUrl = getS3BaseUrl(env)
+  const url = buildMultipartUrl(baseUrl, filename, "part", uploadId, partNumber)
+  const headers = createUploadHeaders(contentLength, contentMd5)
+
+  const signedRequest = await signer.sign(url, {
+    method: HttpMethod.PUT,
+    headers,
+    body,
+  })
+
+  return await fetch(signedRequest)
+}
+
+async function executeMultipartInit(
+  env: Env,
+  filename: string,
+  sourceHeaders: Headers,
+): Promise<Response> {
+  const signer = getAwsClient(env)
+  const baseUrl = getS3BaseUrl(env)
+  const url = buildMultipartUrl(baseUrl, filename, "uploads")
+  const headers = createMultipartHeaders(sourceHeaders)
+
+  const signedRequest = await signer.sign(url, {
+    method: HttpMethod.POST,
+    headers,
+  })
+
+  return await fetch(signedRequest)
+}
+
+async function executeMultipartCompletion(
+  env: Env,
+  filename: string,
+  uploadId: string,
+  body: ReadableStream,
+  contentLength?: string,
+): Promise<Response> {
+  const signer = getAwsClient(env)
+  const baseUrl = getS3BaseUrl(env)
+  const url = buildMultipartUrl(baseUrl, filename, "completion", uploadId)
+  const headers = createXmlHeaders(contentLength)
+
+  const signedRequest = await signer.sign(url, {
+    method: HttpMethod.POST,
+    headers,
+    body,
+  })
+
+  return await fetch(signedRequest)
+}
+
+async function executeMultipartAbort(
+  env: Env,
+  filename: string,
+  uploadId: string,
+): Promise<Response> {
+  const signer = getAwsClient(env)
+  const baseUrl = getS3BaseUrl(env)
+  const url = buildMultipartUrl(baseUrl, filename, "abort", uploadId)
+
+  const signedRequest = await signer.sign(url, {
+    method: HttpMethod.DELETE,
+  })
+
+  return await fetch(signedRequest)
+}
+
+// ─────────────────────────────────────── Route Handler Functions ───────────────────────────────────────
 async function handleMultipartUploadPart(
   c: Context<{ Bindings: Env }>,
   filename: string,
@@ -333,39 +595,27 @@ async function handleMultipartUploadPart(
   uploadId: string,
 ): Promise<Response> {
   const validatedPartNumber = validatePartNumber(partNumber)
-
   await enforceUrlSigning(c.env, `/${filename}`, c.req.url)
 
-  const body = c.req.raw.body
-  if (!body) {
-    throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
-      message: "Request body is required for part upload",
-    })
+  const body = validateRequestBody(c.req.raw.body, "part upload")
+
+  // Validate part size (we don't know if it's the last part, so we'll be lenient for now)
+  // S3 will ultimately validate this on completion
+  const contentLength = c.req.header("content-length")
+  if (contentLength) {
+    validatePartSize(contentLength, validatedPartNumber, true) // Allow smaller parts for now
   }
 
   try {
-    const signer = getAwsClient(c.env)
-    const baseUrl = getS3BaseUrl(c.env)
-    const url = buildMultipartUrl(
-      baseUrl,
+    const response = await executeMultipartUploadPart(
+      c.env,
       filename,
-      "part",
-      uploadId,
       partNumber,
-    )
-
-    const headers = createPartUploadHeaders(
-      c.req.header("content-length"),
+      uploadId,
+      body,
+      contentLength,
       c.req.header("content-md5"),
     )
-
-    const signedRequest = await signer.sign(url, {
-      method: HttpMethod.PUT,
-      headers,
-      body,
-    })
-
-    const response = await fetch(signedRequest)
 
     if (!response.ok) {
       await handleS3ResponseError(
@@ -380,45 +630,20 @@ async function handleMultipartUploadPart(
   }
 }
 
-// ─────────────────────────────────────── Route Handlers ───────────────────────────────────────
-
-// Upload file - PUT /:filename
-upload.put("/:filename{.*}", filenameValidator, async (c) => {
-  ensureEnvironmentValidated(c.env)
-
-  const validatedData = c.req.valid("param") as { filename: string }
-  const filename = validatedData.filename
-
-  // Check if this is a multipart upload part request
-  const partNumber = c.req.query("partNumber")
-  const uploadId = c.req.query("uploadId")
-
-  if (partNumber && uploadId) {
-    return handleMultipartUploadPart(c, filename, partNumber, uploadId)
-  }
-
-  // Handle regular file upload
+async function handleRegularUpload(
+  c: Context<{ Bindings: Env }>,
+  filename: string,
+): Promise<Response> {
   await enforceUrlSigning(c.env, `/${filename}`, c.req.url)
-
-  const body = c.req.raw.body
-  if (!body) {
-    throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
-      message: "Request body is required for PUT uploads",
-    })
-  }
-
-  const headers = forwardS3Headers(c.req.raw.headers)
-  const signer = getAwsClient(c.env)
-  const url = `${getS3BaseUrl(c.env)}/${filename}`
+  const body = validateRequestBody(c.req.raw.body, "PUT uploads")
 
   try {
-    const signedRequest = await signer.sign(url, {
-      method: HttpMethod.PUT,
-      headers,
+    const response = await executeSimpleUpload(
+      c.env,
+      filename,
       body,
-    })
-
-    const response = await fetch(signedRequest)
+      c.req.raw.headers,
+    )
 
     if (!response.ok) {
       await handleS3ResponseError(response, "Upload failed")
@@ -428,9 +653,28 @@ upload.put("/:filename{.*}", filenameValidator, async (c) => {
   } catch (error) {
     handleUploadError(error, "Upload failed")
   }
+}
+
+// ─────────────────────────────────────── Router Instance ───────────────────────────────────────
+const upload = new Hono<{ Bindings: Env }>()
+
+// ─────────────────────────────────────── Route Handlers ───────────────────────────────────────
+upload.put("/:filename{.*}", filenameValidator, async (c) => {
+  ensureEnvironmentValidated(c.env)
+
+  const validatedData = c.req.valid("param") as { filename: string }
+  const filename = validatedData.filename
+
+  const partNumber = c.req.query("partNumber")
+  const uploadId = c.req.query("uploadId")
+
+  if (partNumber && uploadId) {
+    return handleMultipartUploadPart(c, filename, partNumber, uploadId)
+  }
+
+  return handleRegularUpload(c, filename)
 })
 
-// Generate presigned upload URL - POST /presigned-upload
 upload.post(
   "/presigned-upload",
   zValidator("json", presignedUploadSchema),
@@ -443,9 +687,7 @@ upload.post(
 
       const signer = getAwsClient(c.env)
       const url = `${getS3BaseUrl(c.env)}/${key}`
-
       const headers = createPresignedUrlHeaders(conditions)
-      const expirationTimestamp = Math.floor(Date.now() / 1000) + expiresIn
 
       const presignedUrl = await generatePresignedUrl(
         signer,
@@ -455,15 +697,12 @@ upload.post(
         expiresIn,
       )
 
-      const response = {
+      const response = createPresignedUrlResponse(
         presignedUrl,
         key,
         expiresIn,
-        expiresAt: new Date(expirationTimestamp * 1000).toISOString(),
-        method: "PUT",
-        requiredHeaders: Object.fromEntries(headers.entries()),
-      }
-
+        headers,
+      )
       return c.json(response)
     } catch (error) {
       handleUploadError(error, "Failed to generate presigned URL")
@@ -471,7 +710,6 @@ upload.post(
   },
 )
 
-// Multipart upload initiation - POST /:filename/uploads
 upload.post("/:filename{.*}/uploads", filenameValidator, async (c) => {
   ensureEnvironmentValidated(c.env)
 
@@ -481,18 +719,11 @@ upload.post("/:filename{.*}/uploads", filenameValidator, async (c) => {
   await enforceUrlSigning(c.env, `/${filename}/uploads`, c.req.url)
 
   try {
-    const signer = getAwsClient(c.env)
-    const baseUrl = getS3BaseUrl(c.env)
-    const url = buildMultipartUrl(baseUrl, filename, "uploads")
-
-    const headers = createMultipartInitHeaders(c.req.raw.headers)
-
-    const signedRequest = await signer.sign(url, {
-      method: HttpMethod.POST,
-      headers,
-    })
-
-    const response = await fetch(signedRequest)
+    const response = await executeMultipartInit(
+      c.env,
+      filename,
+      c.req.raw.headers,
+    )
 
     if (!response.ok) {
       await handleS3ResponseError(
@@ -507,48 +738,45 @@ upload.post("/:filename{.*}/uploads", filenameValidator, async (c) => {
   }
 })
 
-// Complete multipart upload - POST /:filename?uploadId=
 upload.post("/:filename{.*}", filenameValidator, async (c) => {
-  const uploadId = c.req.query("uploadId")
-
-  if (!uploadId) {
-    throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
-      message:
-        "Invalid request. For multipart completion, uploadId is required",
-    })
-  }
-
   ensureEnvironmentValidated(c.env)
 
   const validatedData = c.req.valid("param") as { filename: string }
   const filename = validatedData.filename
+  const uploadId = validateUploadId(
+    c.req.query("uploadId"),
+    "multipart completion",
+  )
 
   await enforceUrlSigning(c.env, `/${filename}`, c.req.url)
-
-  const body = c.req.raw.body
-  if (!body) {
-    throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
-      message:
-        "Request body with part list is required for completing multipart upload",
-    })
-  }
+  const body = validateRequestBody(
+    c.req.raw.body,
+    "completing multipart upload",
+  )
 
   try {
-    const signer = getAwsClient(c.env)
-    const baseUrl = getS3BaseUrl(c.env)
-    const url = buildMultipartUrl(baseUrl, filename, "completion", uploadId)
+    // Validate and parse the multipart completion XML
+    const { xml, parsedParts } = await validateMultipartCompletionXML(body)
 
-    const headers = createMultipartCompletionHeaders(
-      c.req.header("content-length"),
+    console.log(
+      `Completing multipart upload for ${filename} with ${parsedParts.length} parts`,
     )
 
-    const signedRequest = await signer.sign(url, {
-      method: HttpMethod.POST,
-      headers,
-      body,
+    // Create a new ReadableStream with the validated XML
+    const xmlStream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(xml))
+        controller.close()
+      },
     })
 
-    const response = await fetch(signedRequest)
+    const response = await executeMultipartCompletion(
+      c.env,
+      filename,
+      uploadId,
+      xmlStream,
+      xml.length.toString(),
+    )
 
     if (!response.ok) {
       await handleS3ResponseError(
@@ -563,44 +791,23 @@ upload.post("/:filename{.*}", filenameValidator, async (c) => {
   }
 })
 
-// Abort multipart upload - DELETE /:filename?uploadId=
 upload.delete("/:filename{.*}", filenameValidator, async (c) => {
-  const uploadId = c.req.query("uploadId")
-
-  if (!uploadId) {
-    throw new HTTPException(HTTP_STATUS.BAD_REQUEST, {
-      message: "Invalid request. For multipart abort, uploadId is required",
-    })
-  }
-
   ensureEnvironmentValidated(c.env)
 
   const validatedData = c.req.valid("param") as { filename: string }
   const filename = validatedData.filename
+  const uploadId = validateUploadId(c.req.query("uploadId"), "multipart abort")
 
   await enforceUrlSigning(c.env, `/${filename}`, c.req.url)
 
   try {
-    const signer = getAwsClient(c.env)
-    const baseUrl = getS3BaseUrl(c.env)
-    const url = buildMultipartUrl(baseUrl, filename, "abort", uploadId)
-
-    const signedRequest = await signer.sign(url, {
-      method: HttpMethod.DELETE,
-    })
-
-    const response = await fetch(signedRequest)
+    const response = await executeMultipartAbort(c.env, filename, uploadId)
 
     if (!response.ok) {
       await handleS3ResponseError(response, "Multipart upload abort failed")
     }
 
-    return c.json({
-      success: true,
-      message: `Multipart upload for '${filename}' aborted successfully`,
-      uploadId,
-      abortedAt: new Date().toISOString(),
-    })
+    return c.json(createAbortSuccessResponse(filename, uploadId))
   } catch (error) {
     handleUploadError(error, "Multipart upload abort failed")
   }

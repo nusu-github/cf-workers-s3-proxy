@@ -10,8 +10,14 @@ import { ensureEnvironmentValidated } from "../lib/validation.js"
 import { HttpMethod } from "../types/s3.js"
 import { filenameValidator } from "../validators/filename.js"
 
-const deleteRoute = new Hono<{ Bindings: Env }>()
+// ─────────────────────────────────────── Constants ───────────────────────────────────────
+const HTTP_STATUS = {
+  NO_CONTENT: 204,
+  BAD_GATEWAY: 502,
+  NOT_IMPLEMENTED: 501,
+} as const
 
+// ─────────────────────────────────────── Schemas ───────────────────────────────────────
 const batchDeleteSchema = z.object({
   keys: z
     .array(z.string().min(1, "Key cannot be empty"))
@@ -20,197 +26,228 @@ const batchDeleteSchema = z.object({
   quiet: z.boolean().optional().default(false),
 })
 
-// Delete file - DELETE /:filename
+// ─────────────────────────────────────── Auth Helper Functions ───────────────────────────────────────
+async function enforceUrlSigning(
+  env: Env,
+  pathname: string,
+  requestUrl: string,
+): Promise<void> {
+  if (!shouldEnforceUrlSigning(env, pathname)) return
+
+  if (!env.URL_SIGNING_SECRET) {
+    throw new HTTPException(HTTP_STATUS.NOT_IMPLEMENTED, {
+      message: "URL signing is required but not configured",
+    })
+  }
+
+  await verifySignature(new URL(requestUrl), env.URL_SIGNING_SECRET)
+}
+
+// ─────────────────────────────────────── Error Helper Functions ───────────────────────────────────────
+function handleDeleteError(error: unknown, context: string): never {
+  console.error(`${context}:`, error)
+
+  if (error instanceof HTTPException) {
+    throw error
+  }
+
+  const message =
+    error instanceof Error ? error.message : "Unknown error occurred"
+  throw new HTTPException(HTTP_STATUS.BAD_GATEWAY, {
+    message: `${context}: ${message}`,
+  })
+}
+
+async function handleS3ResponseError(
+  response: Response,
+  context: string,
+): Promise<void> {
+  let errorDetails = ""
+  try {
+    errorDetails = await response.text()
+  } catch (readError) {
+    console.error("Failed to read error response:", readError)
+  }
+
+  const statusMessage = `${response.status} ${response.statusText}`
+  const fullMessage = `${context}: ${statusMessage}${errorDetails ? ` - ${errorDetails}` : ""}`
+
+  throw new HTTPException(response.status as ContentfulStatusCode, {
+    message: fullMessage,
+  })
+}
+
+// ─────────────────────────────────────── Request Helper Functions ───────────────────────────────────────
+function createDeleteHeaders(versionId?: string): Headers {
+  const headers = new Headers()
+  if (versionId) {
+    headers.set("x-amz-version-id", versionId)
+  }
+  return headers
+}
+
+function createBatchDeleteHeaders(xmlPayload: string): Headers {
+  const headers = new Headers()
+  headers.set("Content-Type", "application/xml")
+
+  const contentLength = new TextEncoder().encode(xmlPayload).length
+  headers.set("Content-Length", contentLength.toString())
+
+  return headers
+}
+
+async function calculateContentMD5(content: string): Promise<string> {
+  const encoder = new TextEncoder()
+  const data = encoder.encode(content)
+  const hashBuffer = await crypto.subtle.digest("MD5", data)
+  const hashArray = Array.from(new Uint8Array(hashBuffer))
+  return btoa(String.fromCharCode(...hashArray))
+}
+
+// ─────────────────────────────────────── XML Helper Functions ───────────────────────────────────────
+function escapeXml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;")
+}
+
+function createDeleteXmlObject(key: string): string {
+  const escapedKey = escapeXml(key)
+  return `    <Object><Key>${escapedKey}</Key></Object>`
+}
+
+function createBatchDeleteXml(keys: string[], quiet: boolean): string {
+  const xmlObjects = keys.map(createDeleteXmlObject).join("\n")
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Delete>
+  <Quiet>${quiet}</Quiet>
+${xmlObjects}
+</Delete>`
+}
+
+// ─────────────────────────────────────── Response Helper Functions ───────────────────────────────────────
+function createDeleteSuccessResponse(filename: string) {
+  return {
+    success: true,
+    message: `File '${filename}' deleted successfully`,
+    deletedAt: new Date().toISOString(),
+  }
+}
+
+function createBatchDeleteSuccessResponse(
+  keyCount: number,
+  _uploadId?: string,
+) {
+  return {
+    success: true,
+    message: `Batch delete initiated for ${keyCount} objects`,
+    deletedAt: new Date().toISOString(),
+    quiet: true,
+  }
+}
+
+// ─────────────────────────────────────── Core Delete Functions ───────────────────────────────────────
+async function executeSingleDelete(
+  env: Env,
+  filename: string,
+  versionId?: string,
+): Promise<Response> {
+  const signer = getAwsClient(env)
+  const url = `${getS3BaseUrl(env)}/${filename}`
+  const headers = createDeleteHeaders(versionId)
+
+  const signedRequest = await signer.sign(url, {
+    method: HttpMethod.DELETE,
+    headers,
+  })
+
+  return await fetch(signedRequest)
+}
+
+async function executeBatchDelete(
+  env: Env,
+  keys: string[],
+  quiet: boolean,
+): Promise<Response> {
+  const signer = getAwsClient(env)
+  const url = `${getS3BaseUrl(env)}?delete`
+
+  const xmlPayload = createBatchDeleteXml(keys, quiet)
+  const headers = createBatchDeleteHeaders(xmlPayload)
+
+  const contentMD5 = await calculateContentMD5(xmlPayload)
+  headers.set("Content-MD5", contentMD5)
+
+  const signedRequest = await signer.sign(url, {
+    method: HttpMethod.POST,
+    headers,
+    body: xmlPayload,
+  })
+
+  return await fetch(signedRequest)
+}
+
+// ─────────────────────────────────────── Router Instance ───────────────────────────────────────
+const deleteRoute = new Hono<{ Bindings: Env }>()
+
+// ─────────────────────────────────────── Route Handlers ───────────────────────────────────────
 deleteRoute.delete("/:filename{.*}", filenameValidator, async (c) => {
-  // Ensure environment is validated
   ensureEnvironmentValidated(c.env)
 
   const validatedData = c.req.valid("param") as { filename: string }
   const filename = validatedData.filename
 
-  // Security: Enhanced URL signing enforcement for deletions
-  const pathname = `/${filename}`
-  if (shouldEnforceUrlSigning(c.env, pathname)) {
-    if (!c.env.URL_SIGNING_SECRET) {
-      throw new HTTPException(501, {
-        message: "URL signing is required but not configured",
-      })
-    }
-    await verifySignature(new URL(c.req.url), c.env.URL_SIGNING_SECRET)
-  }
-
-  const signer = getAwsClient(c.env)
-  const url = `${getS3BaseUrl(c.env)}/${filename}`
+  await enforceUrlSigning(c.env, `/${filename}`, c.req.url)
 
   try {
-    // Prepare headers for the delete request
-    const headers = new Headers()
-
-    // Forward version ID if provided (for versioned objects)
     const versionId = c.req.query("versionId")
-    if (versionId) {
-      headers.set("x-amz-version-id", versionId)
+    const response = await executeSingleDelete(c.env, filename, versionId)
+
+    if (response.status === HTTP_STATUS.NO_CONTENT) {
+      return c.json(createDeleteSuccessResponse(filename))
     }
 
-    // Sign and execute the delete request
-    const signedRequest = await signer.sign(url, {
-      method: HttpMethod.DELETE,
-      headers: headers,
-    })
-
-    const response = await fetch(signedRequest)
-
-    // S3 returns 204 No Content for successful deletions
-    // It also returns 204 if the object doesn't exist (idempotent)
-    if (response.status === 204) {
-      return c.json({
-        success: true,
-        message: `File '${filename}' deleted successfully`,
-        deletedAt: new Date().toISOString(),
-      })
-    }
-
-    // Handle other response codes
     if (!response.ok) {
-      const errorText = await response.text()
-      throw new HTTPException(response.status as ContentfulStatusCode, {
-        message: `Delete failed: ${response.statusText} - ${errorText}`,
-      })
+      await handleS3ResponseError(response, "Delete failed")
     }
 
-    // Return the raw S3 response for any other successful status
-    // Clone the response to avoid body consumption issues
+    // Return raw S3 response for other successful status codes
     return response.clone()
   } catch (error) {
-    console.error("Delete error:", error)
-
-    if (error instanceof HTTPException) {
-      throw error
-    }
-
-    if (error instanceof Error) {
-      throw new HTTPException(502, {
-        message: `Delete failed: ${error.message}`,
-      })
-    }
-
-    throw new HTTPException(502, {
-      message: "Delete failed: Unknown error occurred",
-    })
+    handleDeleteError(error, "Delete failed")
   }
 })
 
-// Batch delete - POST /delete
 deleteRoute.post(
   "/delete",
   zValidator("json", batchDeleteSchema),
   async (c) => {
-    // Ensure environment is validated
     ensureEnvironmentValidated(c.env)
-
-    // Security: URL signing enforcement for batch delete
-    if (shouldEnforceUrlSigning(c.env, "/delete")) {
-      if (!c.env.URL_SIGNING_SECRET) {
-        throw new HTTPException(501, {
-          message: "URL signing is required but not configured",
-        })
-      }
-      await verifySignature(new URL(c.req.url), c.env.URL_SIGNING_SECRET)
-    }
+    await enforceUrlSigning(c.env, "/delete", c.req.url)
 
     try {
       const { keys, quiet } = c.req.valid("json")
-
-      const signer = getAwsClient(c.env)
-      const url = `${getS3BaseUrl(c.env)}?delete`
-
-      // Build the S3 batch delete XML payload
-      const xmlObjects = keys
-        .map((key: string) => {
-          // Escape XML characters in the key
-          const escapedKey = key
-            .replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;")
-            .replace(/"/g, "&quot;")
-            .replace(/'/g, "&apos;")
-
-          return `    <Object><Key>${escapedKey}</Key></Object>`
-        })
-        .join("\n")
-
-      const xmlPayload = `<?xml version="1.0" encoding="UTF-8"?>
-<Delete>
-  <Quiet>${quiet}</Quiet>
-${xmlObjects}
-</Delete>`
-
-      // Prepare headers
-      const headers = new Headers()
-      headers.set("Content-Type", "application/xml")
-      headers.set(
-        "Content-Length",
-        new TextEncoder().encode(xmlPayload).length.toString(),
-      )
-
-      // Calculate Content-MD5 for data integrity
-      const encoder = new TextEncoder()
-      const data = encoder.encode(xmlPayload)
-      const hashBuffer = await crypto.subtle.digest("MD5", data)
-      const hashArray = Array.from(new Uint8Array(hashBuffer))
-      const hashBase64 = btoa(String.fromCharCode(...hashArray))
-      headers.set("Content-MD5", hashBase64)
-
-      // Sign and execute the batch delete request
-      const signedRequest = await signer.sign(url, {
-        method: HttpMethod.POST,
-        headers: headers,
-        body: xmlPayload,
-      })
-
-      const response = await fetch(signedRequest)
+      const response = await executeBatchDelete(c.env, keys, quiet)
 
       if (!response.ok) {
-        const errorText = await response.text()
-        throw new HTTPException(response.status as ContentfulStatusCode, {
-          message: `Batch delete failed: ${response.statusText} - ${errorText}`,
-        })
+        await handleS3ResponseError(response, "Batch delete failed")
       }
 
-      // Parse the response if not in quiet mode
       if (!quiet) {
-        // Clone response before reading body to avoid consumption issues
-        const responseClone = response.clone()
-        const responseText = await responseClone.text()
+        const responseText = await response.clone().text()
         return new Response(responseText, {
           status: response.status,
           headers: response.headers,
         })
       }
 
-      // Return success response for quiet mode
-      return c.json({
-        success: true,
-        message: `Batch delete initiated for ${keys.length} objects`,
-        deletedAt: new Date().toISOString(),
-        quiet: true,
-      })
+      return c.json(createBatchDeleteSuccessResponse(keys.length))
     } catch (error) {
-      console.error("Batch delete error:", error)
-
-      if (error instanceof HTTPException) {
-        throw error
-      }
-
-      if (error instanceof Error) {
-        throw new HTTPException(500, {
-          message: `Batch delete failed: ${error.message}`,
-        })
-      }
-
-      throw new HTTPException(500, {
-        message: "Batch delete failed: Unknown error occurred",
-      })
+      handleDeleteError(error, "Batch delete failed")
     }
   },
 )

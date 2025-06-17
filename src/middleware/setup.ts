@@ -8,15 +8,28 @@ import { secureHeaders } from "hono/secure-headers"
 import { timing } from "hono/timing"
 
 // ───────────────────────────────────────── Constants  ─────────────────────────────────────────
+
+/**
+ * Size calculation constants for body limits
+ */
+const MEGABYTES_TO_BYTES = 1024 * 1024
+const DEFAULT_MAX_SIZE_MB = 100
+
 /**
  * Default body size limit in bytes (100MB)
  */
-const DEFAULT_MAX_BODY_SIZE = 100 * 1024 * 1024
+const DEFAULT_MAX_BODY_SIZE = DEFAULT_MAX_SIZE_MB * MEGABYTES_TO_BYTES
+
+/**
+ * Time calculation constants for caching
+ */
+const SECONDS_PER_HOUR = 3600
+const HOURS_PER_DAY = 24
 
 /**
  * Cache control max age for preflight requests (24 hours)
  */
-const CORS_MAX_AGE_SECONDS = 86400
+const CORS_MAX_AGE_SECONDS = HOURS_PER_DAY * SECONDS_PER_HOUR
 
 /**
  * Security header configuration constants
@@ -128,10 +141,14 @@ export function setupBodyLimit(maxSize = DEFAULT_MAX_BODY_SIZE) {
   return bodyLimit({
     maxSize,
     onError: (c) => {
-      console.warn(`Request body exceeded limit: ${maxSize} bytes`, {
-        path: c.req.path,
-        method: c.req.method,
-        contentLength: c.req.header("content-length"),
+      const requestPath = c.req.path
+      const requestMethod = c.req.method
+      const contentLength = c.req.header("content-length")
+
+      console.error(`Request body size limit exceeded: ${maxSize} bytes`, {
+        path: requestPath,
+        method: requestMethod,
+        contentLength,
       })
 
       return c.json(
@@ -154,10 +171,11 @@ export function setupBodyLimit(maxSize = DEFAULT_MAX_BODY_SIZE) {
  * @returns Array of trimmed origin strings
  */
 function parseAllowedOrigins(originsConfig: string): string[] {
-  return originsConfig
-    .split(",")
-    .map((origin: string) => origin.trim())
-    .filter((origin: string) => origin.length > 0)
+  const originList = originsConfig.split(",")
+  const trimmedOrigins = originList.map((origin) => origin.trim())
+  const validOrigins = trimmedOrigins.filter((origin) => origin.length > 0)
+
+  return validOrigins
 }
 
 /**
@@ -172,13 +190,13 @@ function validateOrigin(
   origin: string,
   allowedOrigins: string[],
 ): string | undefined {
-  // Allow wildcard configuration
-  if (allowedOrigins.includes("*")) {
+  const hasWildcardPermission = allowedOrigins.includes("*")
+  if (hasWildcardPermission) {
     return "*"
   }
 
-  // Check exact origin match
-  if (allowedOrigins.includes(origin)) {
+  const hasExactMatch = allowedOrigins.includes(origin)
+  if (hasExactMatch) {
     return origin
   }
 
@@ -192,11 +210,14 @@ function validateOrigin(
 export function setupCors() {
   return cors({
     origin: (origin: string | undefined, c: Context<{ Bindings: Env }>) => {
-      // Allow requests without origin header (e.g., server-to-server)
-      if (!origin) return "*"
+      const hasNoOriginHeader = !origin
+      if (hasNoOriginHeader) {
+        return "*" // Allow requests without origin header (e.g., server-to-server)
+      }
 
       const originsConfig = c.env.CORS_ALLOW_ORIGINS ?? "*"
-      const allowedOrigins = parseAllowedOrigins(originsConfig.toString())
+      const configAsString = originsConfig.toString()
+      const allowedOrigins = parseAllowedOrigins(configAsString)
 
       return validateOrigin(origin, allowedOrigins)
     },
@@ -214,8 +235,8 @@ export function setupCors() {
  */
 export function setupLogger() {
   return logger((str, ...rest) => {
-    const timestamp = new Date().toISOString()
-    console.log(`[${timestamp}] ${str}`, ...rest)
+    const currentTimestamp = new Date().toISOString()
+    console.log(`[${currentTimestamp}] ${str}`, ...rest)
   })
 }
 

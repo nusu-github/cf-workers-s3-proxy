@@ -1,32 +1,32 @@
 # Cloudflare Workers S3 Proxy
 
-![Cloudflare Workers](https://img.shields.io/badge/cloudflare%20workers-F38020?style=for-the-badge\&logo=cloudflare) ![Hono](https://img.shields.io/badge/hono-E36002?style=for-the-badge\&logo=hono) ![MIT License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
+![Cloudflare Workers](https://img.shields.io/badge/cloudflare%20workers-F38020?style=for-the-badge&logo=cloudflare) ![Hono](https://img.shields.io/badge/hono-E36002?style=for-the-badge&logo=hono) ![MIT License](https://img.shields.io/badge/license-MIT-green?style=for-the-badge)
 
 A lightweight, cache‑friendly proxy that lets you serve objects from any S3‑compatible storage (Backblaze B2, MinIO,DigitalOcean Spaces, etc.) through the Cloudflare edge. Perfect for static asset hosting, private downloads, or as adrop‑in CDN for existing buckets.
 
 ## Table of Contents
 
-* [Features](#features)
-* [Quick Start](#quick-start)
-* [Deployment](#deployment)
-* [Configuration](#configuration)
-* [API Reference](#api-reference)
-* [Signed URLs](#signed-urls)
-* [Cache Management](#cache-management)
-* [Security Notes](#security-notes)
-* [Roadmap](#roadmap)
-* [Contributing](#contributing)
-* [License](#license)
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [Deployment](#deployment)
+- [Configuration](#configuration)
+- [API Reference](#api-reference)
+- [Signed URLs](#signed-urls)
+- [Cache Management](#cache-management)
+- [Security Notes](#security-notes)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Features
 
-* **Edge‑level Authentication** – Optional signed URLs with expiration.
-* **Range Requests & Partial Responses** – Stream video, large files, and resume interrupted downloads.
-* **Advanced Cache Management** – Intelligent caching with TTL control, metrics, and purging.
-* **Automatic Path Normalisation** – Protection against directory traversal.
-* **Flexible CORS** – Fine‑grained per‑origin allow‑list via environment variable.
-* **Prometheus Metrics & Health Check** endpoints.
-* **Built with [Hono](https://honojs.dev) on Cloudflare Workers** for minimal cold starts.
+- **Edge‑level Authentication** – Optional signed URLs with expiration.
+- **Range Requests & Partial Responses** – Stream video, large files, and resume interrupted downloads.
+- **Advanced Cache Management** – Intelligent caching with TTL control, metrics, and purging.
+- **Automatic Path Normalisation** – Protection against directory traversal.
+- **Flexible CORS** – Fine‑grained per‑origin allow‑list via environment variable.
+- **Health Check** endpoint.
+- **Built with [Hono](https://honojs.dev) on Cloudflare Workers** for minimal cold starts.
 
 ## Quick Start
 
@@ -55,42 +55,60 @@ Ensure `wrangler.toml` contains the **\[vars]** block below.
 
 ## Configuration
 
-| Variable                    | Description                                   | Example                                       |
-|-----------------------------|-----------------------------------------------|-----------------------------------------------|
-| `END_POINT`                 | S3 API endpoint                               | `https://s3.us-west-1.amazonaws.com`          |
-| `ACCESS_KEY`                | Access key ID                                 | `AKIAEXAMPLE`                                 |
-| `SECRET_KEY`                | Secret access key                             | `wJalrX...`                                   |
-| `BUCKET_NAME`               | Bucket to proxy                               | `my-assets`                                   |
-| `RANGE_RETRY_ATTEMPTS`      | Max retries for 206 responses                 | `3`                                           |
-| `URL_SIGNING_SECRET`        | HMAC secret for signed URLs (omit to disable) | `super‑secret`                                |
-| `CORS_ALLOW_ORIGINS`        | Comma‑separated allow‑list                    | `https://example.com,https://app.example.com` |
-| `VERSION`                   | Arbitrary version string                      | `v1.0.0`                                      |
-| `CACHE_ENABLED`             | Enable caching                                | `true`                                        |
-| `CACHE_TTL_SECONDS`         | Cache TTL in seconds                          | `3600`                                        |
-| `CACHE_DEBUG`               | Enable debug mode                             | `false`                                       |
-| `CACHE_MIN_TTL_SECONDS`     | Minimum cache TTL in seconds                  | `60`                                          |
-| `CACHE_MAX_TTL_SECONDS`     | Maximum cache TTL in seconds                  | `86400`                                       |
-| `CACHE_OVERRIDE_S3_HEADERS` | Override S3 headers in cache                  | `false`                                       |
-| `CACHE_PURGE_SECRET`        | Secret for cache invalidation                 | `your-secure-secret`                          |
+| Variable                     | Description                             | Example                                       | Required |
+| ---------------------------- | --------------------------------------- | --------------------------------------------- | -------- |
+| `END_POINT`                  | S3 API endpoint                         | `https://s3.us-west-1.amazonaws.com`          | Yes      |
+| `ACCESS_KEY`                 | S3 access key ID                        | `AKIAEXAMPLE`                                 | Yes      |
+| `SECRET_KEY`                 | S3 secret access key                    | `wJalrX...`                                   | Yes      |
+| `BUCKET_NAME`                | S3 bucket to proxy                      | `my-assets`                                   | Yes      |
+| `S3_REGION`                  | AWS region for S3 operations            | `us-west-1`                                   | Yes      |
+| `RANGE_RETRY_ATTEMPTS`       | Max retries for range requests          | `3`                                           | Yes      |
+| `URL_SIGNING_SECRET`         | HMAC secret for signed URLs             | `super-secret-32-chars-minimum`               | No       |
+| `CORS_ALLOW_ORIGINS`         | Comma-separated CORS origins            | `https://example.com,https://app.example.com` | No       |
+| `VERSION`                    | Version identifier                      | `v1.0.0`                                      | No       |
+| `CACHE_ENABLED`              | Enable caching system                   | `true`                                        | No       |
+| `CACHE_TTL_SECONDS`          | Default cache TTL (1-604800)            | `3600`                                        | No       |
+| `CACHE_DEBUG`                | Enable cache debug headers              | `false`                                       | No       |
+| `CACHE_MIN_TTL_SECONDS`      | Minimum cache TTL (1-86400)             | `60`                                          | No       |
+| `CACHE_MAX_TTL_SECONDS`      | Maximum cache TTL (60-604800)           | `86400`                                       | No       |
+| `CACHE_OVERRIDE_S3_HEADERS`  | Override S3 cache headers               | `false`                                       | No       |
+| `CACHE_PURGE_SECRET`         | Secret for cache purge operations       | `your-secure-secret`                          | No       |
+| `ENFORCE_URL_SIGNING`        | Require URL signing for all requests    | `false`                                       | No       |
+| `URL_SIGNING_REQUIRED_PATHS` | Comma-separated paths requiring signing | `/private,/secure`                            | No       |
+| `ENABLE_LIST_ENDPOINT`       | Enable directory listing endpoint       | `true`                                        | No       |
+| `ENABLE_UPLOAD_ENDPOINT`     | Enable file upload endpoints            | `true`                                        | No       |
+| `ENABLE_DELETE_ENDPOINT`     | Enable file deletion endpoints          | `true`                                        | No       |
+| `PREFIX_MAX_LENGTH`          | Maximum prefix length (1-1024)          | `256`                                         | No       |
+| `PREFIX_MAX_DEPTH`           | Maximum prefix depth (1-50)             | `10`                                          | No       |
 
-Example `wrangler.toml` snippet:
+Example `wrangler.jsonc` snippet:
 
-```toml
-[vars]
-END_POINT = "..."
-ACCESS_KEY = "..."
-SECRET_KEY = "..."
-BUCKET_NAME = "..."
-RANGE_RETRY_ATTEMPTS = 3
-CORS_ALLOW_ORIGINS = "https://example.com"
-VERSION = "v1.0.0"
-CACHE_ENABLED = true
-CACHE_TTL_SECONDS = 3600
-CACHE_DEBUG = false
-CACHE_MIN_TTL_SECONDS = 60
-CACHE_MAX_TTL_SECONDS = 86400
-CACHE_OVERRIDE_S3_HEADERS = false
-CACHE_PURGE_SECRET = "your-secure-secret"
+```jsonc
+{
+  "name": "my-s3-proxy",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-01-01",
+  "vars": {
+    "END_POINT": "https://s3.us-west-1.amazonaws.com",
+    "ACCESS_KEY": "AKIAEXAMPLE",
+    "SECRET_KEY": "wJalrX...",
+    "BUCKET_NAME": "my-assets",
+    "S3_REGION": "us-west-1",
+    "RANGE_RETRY_ATTEMPTS": 3,
+    "CORS_ALLOW_ORIGINS": "https://example.com",
+    "VERSION": "v1.0.0",
+    "CACHE_ENABLED": true,
+    "CACHE_TTL_SECONDS": 3600,
+    "CACHE_DEBUG": false,
+    "CACHE_MIN_TTL_SECONDS": 60,
+    "CACHE_MAX_TTL_SECONDS": 86400,
+    "CACHE_OVERRIDE_S3_HEADERS": false,
+    "CACHE_PURGE_SECRET": "your-secure-secret",
+    "ENABLE_LIST_ENDPOINT": true,
+    "ENABLE_UPLOAD_ENDPOINT": true,
+    "ENABLE_DELETE_ENDPOINT": true
+  }
+}
 ```
 
 ## API Reference
@@ -101,10 +119,7 @@ Returns the object keys directly under the given prefix.
 
 ```json
 {
-  "keys": [
-    "images/a.jpg",
-    "images/b.png"
-  ]
+  "keys": ["images/a.jpg", "images/b.png"]
 }
 ```
 
@@ -112,8 +127,8 @@ Returns the object keys directly under the given prefix.
 
 Fetches the object as‑is. Supports HTTP `Range` headers.
 
-* `download` – forces `Content‑Disposition: attachment` (optionally override filename).
-* `inline` – forces `Content‑Disposition: inline`.
+- `download` – forces `Content‑Disposition: attachment` (optionally override filename).
+- `inline` – forces `Content‑Disposition: inline`.
 
 Examples:
 
@@ -167,9 +182,27 @@ Response:
 }
 ```
 
-### `POST /<filename>/uploads`
+### Multipart Upload Endpoints
 
-Initiates a multipart upload. Forward `Content-Type` and`x-amz-meta-*` headers as needed. The worker proxies the request to S3 and returns the S3 XML response containing the`UploadId`. If URL signing is enabled, this endpoint can be protected by URL signing.
+**Note**: Multipart upload functionality is currently being enhanced. Complete documentation will be available soon.
+
+#### `POST /<filename>/uploads`
+
+Initiates a multipart upload.
+
+#### `PUT /<filename>?partNumber=X&uploadId=Y`
+
+Uploads a part of a multipart upload.
+
+#### `POST /<filename>?uploadId=Y`
+
+Completes a multipart upload.
+
+#### `DELETE /<filename>?uploadId=Y`
+
+Aborts a multipart upload.
+
+_Detailed documentation for multipart upload workflows, XML formats, and examples will be added in the next update._
 
 ### `DELETE /<filename>`
 
@@ -182,10 +215,7 @@ Request body:
 
 ```json
 {
-  "keys": [
-    "path/to/object1.txt",
-    "path/to/object2.jpg"
-  ],
+  "keys": ["path/to/object1.txt", "path/to/object2.jpg"],
   "quiet": false
   // Optional: if true, S3 returns success even if some keys fail (default false)
 }
@@ -197,10 +227,6 @@ A maximum of 1000 keys can be specified. The S3 XML response detailing the resul
 
 Returns build version and server time. Useful for liveness probes.
 
-### `GET /__metrics`
-
-OpenMetrics‑formatted counters: requests, errors, bytes sent, and cache performance metrics.
-
 ### `GET /__cache/stats`
 
 Returns detailed cache statistics including hit rates, configuration, and performance metrics.
@@ -210,12 +236,12 @@ Returns detailed cache statistics including hit rates, configuration, and perfor
   "config": {
     "enabled": true,
     "ttlSeconds": 3600,
-    "overrideS3Headers": false,
+    "overrideS3Headers": false
     // ... more config ...
   },
   "metrics": {
     "cacheHits": 1250,
-    "cacheMisses": 180,
+    "cacheMisses": 180
     // ... more metrics ...
   },
   "performance": {
@@ -280,32 +306,36 @@ curl -X POST /__cache/warm \
 
 ## Signed URLs
 
-```bash
-URL_SIGNING_SECRET=your-secret \
-node src/generate_signed_url.js /private/report.pdf 1800 # path + expiry seconds
+URL signing provides secure, time-limited access to files. Configure the `URL_SIGNING_SECRET` environment variable to enable this feature.
+
+Signed URLs include:
+
+- `exp`: Expiration timestamp
+- `sig`: HMAC-SHA256 signature
+
+Example signed URL format:
+
+```
+https://worker.example.com/private/report.pdf?exp=1710000000&sig=abcdef...
 ```
 
-The script prints a time‑limited URL like:
-
-```
-https://worker.example.com/private/report.pdf?exp=1710000000&sig=abcdef…
-```
+Refer to the documentation for URL signing implementation details and security best practices.
 
 ## Cache Management
 
 This proxy includes a significantly enhanced cache management system that provides better performance, more control, and comprehensive cache operations. Key features include:
 
-* **Hybrid Caching Strategy**: Combines Cloudflare's edge caching with the Cache API.
-* **Enhanced Conditional Request Handling**: ETag and Last-Modified support.
-* **Advanced Cache Invalidation & Management**: Selective and pattern-based purging, cache warming.
-* **Advanced Analytics & Debugging**: Detailed metrics, debug headers, and real-time statistics.
+- **Hybrid Caching Strategy**: Combines Cloudflare's edge caching with the Cache API.
+- **Enhanced Conditional Request Handling**: ETag and Last-Modified support.
+- **Advanced Cache Invalidation & Management**: Selective and pattern-based purging, cache warming.
+- **Advanced Analytics & Debugging**: Detailed metrics, debug headers, and real-time statistics.
 
 ### Cache Endpoints
 
-* `GET /__cache/stats` – Detailed cache statistics and performance metrics.
-* `GET /__cache/health` – Health status of the cache system.
-* `POST /__cache/purge` – Authenticated cache invalidation endpoint.
-* `POST /__cache/warm` – Authenticated endpoint for proactive cache population.
+- `GET /__cache/stats` – Detailed cache statistics and performance metrics.
+- `GET /__cache/health` – Health status of the cache system.
+- `POST /__cache/purge` – Authenticated cache invalidation endpoint.
+- `POST /__cache/warm` – Authenticated endpoint for proactive cache population.
 
 For complete documentation on configuration, best practices, and troubleshooting, see **[docs/cache-management.md](./docs/cache-management.md)**.
 
@@ -313,20 +343,20 @@ For complete documentation on configuration, best practices, and troubleshooting
 
 This proxy implements comprehensive security features for production use, including:
 
-* **Enhanced URL Signature Validation**
-* **Path Traversal Protection**
-* **Cache Security**
-* **Constant-Time Verification**
-* **Appropriate Error Codes**
-* **CORS Protection**
+- **Enhanced URL Signature Validation**
+- **Path Traversal Protection**
+- **Cache Security**
+- **Constant-Time Verification**
+- **Appropriate Error Codes**
+- **CORS Protection**
 
 For complete security documentation, implementation details, and best practices, see **[docs/security.md](./docs/security.md)**.
 
 ## Roadmap
 
-* Object upload endpoint
-* ETag‑aware caching
-* Terraform module for one‑command deploy
+- Object upload endpoint
+- ETag‑aware caching
+- Terraform module for one‑command deploy
 
 ## Contributing
 

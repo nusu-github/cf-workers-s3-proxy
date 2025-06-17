@@ -9,7 +9,7 @@ import { getBooleanEnv } from "./utils.js"
  */
 export function getCacheConfig(env: Env): CacheConfig {
   // Helper function to handle numeric environment variables
-  const getNumber = (
+  const parseNumericEnvVar = (
     value: number | string | undefined,
     defaultValue: number,
   ): number => {
@@ -19,16 +19,16 @@ export function getCacheConfig(env: Env): CacheConfig {
     if (typeof value === "number") {
       return value
     }
-    const parsed = Number.parseInt(value, 10)
-    return Number.isNaN(parsed) ? defaultValue : parsed
+    const parsedValue = Number.parseInt(value, 10)
+    return Number.isNaN(parsedValue) ? defaultValue : parsedValue
   }
 
   return {
     enabled: getBooleanEnv(env.CACHE_ENABLED, true), // Default to true
-    ttlSeconds: getNumber(env.CACHE_TTL_SECONDS, 3600), // Default 1 hour
+    ttlSeconds: parseNumericEnvVar(env.CACHE_TTL_SECONDS, 3600), // Default 1 hour
     overrideS3Headers: getBooleanEnv(env.CACHE_OVERRIDE_S3_HEADERS, false), // Default to false
-    minTtlSeconds: getNumber(env.CACHE_MIN_TTL_SECONDS, 60), // Default 1 minute
-    maxTtlSeconds: getNumber(env.CACHE_MAX_TTL_SECONDS, 86400), // Default 24 hours
+    minTtlSeconds: parseNumericEnvVar(env.CACHE_MIN_TTL_SECONDS, 60), // Default 1 minute
+    maxTtlSeconds: parseNumericEnvVar(env.CACHE_MAX_TTL_SECONDS, 86400), // Default 24 hours
     debug: getBooleanEnv(env.CACHE_DEBUG, false), // Default to false
   }
 }
@@ -57,22 +57,23 @@ export function generateCacheKey(
   // Remove additional cache-busting parameters that shouldn't affect caching
   const cacheBustingParams = ["_", "bust", "nocache", "v", "version"]
 
-  const paramsToExclude = [...signatureParams, ...cacheBustingParams]
+  const excludedParams = [...signatureParams, ...cacheBustingParams]
 
-  for (const param of paramsToExclude) {
-    urlObj.searchParams.delete(param)
+  for (const paramName of excludedParams) {
+    urlObj.searchParams.delete(paramName)
   }
 
   // Sort remaining parameters for consistent cache keys
   urlObj.searchParams.sort()
 
   // Include relevant headers that affect content delivery in cache key
-  const relevantHeaders = ["range", "accept-encoding"]
+  const relevantHeaderNames = ["range", "accept-encoding"]
   const headerParts: string[] = []
-  for (const header of relevantHeaders) {
-    const value = headers.get(header)
-    if (value) {
-      headerParts.push(`${header}:${value}`)
+
+  for (const headerName of relevantHeaderNames) {
+    const headerValue = headers.get(headerName)
+    if (headerValue) {
+      headerParts.push(`${headerName}:${headerValue}`)
     }
   }
 
@@ -86,8 +87,10 @@ export function generateCacheKey(
   }
 
   // Add headers as query parameter if present
-  if (headerParts.length > 0) {
-    cacheUrl.searchParams.set("_cache_headers", headerParts.join("|"))
+  const hasRelevantHeaders = headerParts.length > 0
+  if (hasRelevantHeaders) {
+    const combinedHeaders = headerParts.join("|")
+    cacheUrl.searchParams.set("_cache_headers", combinedHeaders)
   }
 
   // Add version as query parameter if provided
@@ -103,83 +106,101 @@ export function generateCacheKey(
  */
 export function calculateTtl(response: Response, config: CacheConfig): number {
   if (config.overrideS3Headers) {
-    return Math.max(
+    const configuredTtl = config.ttlSeconds
+    const constrainedTtl = Math.max(
       config.minTtlSeconds,
-      Math.min(config.maxTtlSeconds, config.ttlSeconds),
+      Math.min(config.maxTtlSeconds, configuredTtl),
     )
+    return constrainedTtl
   }
 
-  const cacheControl = response.headers.get("cache-control")
-  if (cacheControl) {
-    const maxAgeMatch = cacheControl.match(/max-age=(\d+)/)
+  const cacheControlValue = response.headers.get("cache-control")
+  if (cacheControlValue) {
+    const maxAgeMatch = cacheControlValue.match(/max-age=(\d+)/)
     if (maxAgeMatch?.[1]) {
-      const s3Ttl = Number.parseInt(maxAgeMatch[1], 10)
-      return Math.max(
+      const s3DefinedTtl = Number.parseInt(maxAgeMatch[1], 10)
+      const constrainedS3Ttl = Math.max(
         config.minTtlSeconds,
-        Math.min(config.maxTtlSeconds, s3Ttl),
+        Math.min(config.maxTtlSeconds, s3DefinedTtl),
       )
+      return constrainedS3Ttl
     }
   }
 
-  const expires = response.headers.get("expires")
-  if (expires) {
-    const expiryTime = new Date(expires).getTime()
-    const now = Date.now()
-    if (expiryTime > now) {
-      const s3Ttl = Math.floor((expiryTime - now) / 1000)
-      return Math.max(
+  const expiresValue = response.headers.get("expires")
+  if (expiresValue) {
+    const expiryTime = new Date(expiresValue).getTime()
+    const currentTime = Date.now()
+    const isFutureExpiry = expiryTime > currentTime
+
+    if (isFutureExpiry) {
+      const secondsUntilExpiry = Math.floor((expiryTime - currentTime) / 1000)
+      const constrainedExpiryTtl = Math.max(
         config.minTtlSeconds,
-        Math.min(config.maxTtlSeconds, s3Ttl),
+        Math.min(config.maxTtlSeconds, secondsUntilExpiry),
       )
+      return constrainedExpiryTtl
     }
   }
 
   // Fallback to configured TTL with constraints
-  return Math.max(
+  const fallbackTtl = Math.max(
     config.minTtlSeconds,
     Math.min(config.maxTtlSeconds, config.ttlSeconds),
   )
+  return fallbackTtl
 }
 
 /**
  * Check if response can be cached
  */
-export function canCache(response: Response, method: HttpMethod): boolean {
+export function isCacheable(response: Response, method: HttpMethod): boolean {
   // Don't cache non-GET requests or error responses
-  if (method !== HttpMethod.GET || !response.ok) {
+  const isGetRequest = method === HttpMethod.GET
+  const isSuccessResponse = response.ok
+
+  if (!isGetRequest || !isSuccessResponse) {
     return false
   }
 
   // Don't cache partial content responses (206) or responses with Vary: *
-  if (response.status === 206 || response.headers.get("vary") === "*") {
+  const isPartialContent = response.status === 206
+  const hasWildcardVary = response.headers.get("vary") === "*"
+
+  if (isPartialContent || hasWildcardVary) {
     return false
   }
 
   // Don't cache if response has no-cache directive
-  const cacheControl = response.headers.get("cache-control")
-  return !(
-    cacheControl?.includes("no-cache") || cacheControl?.includes("no-store")
-  )
+  const cacheControlValue = response.headers.get("cache-control")
+  const hasNoCacheDirective =
+    cacheControlValue?.includes("no-cache") ||
+    cacheControlValue?.includes("no-store")
+
+  return !hasNoCacheDirective
 }
 
 /**
  * Enhanced conditional request handling
  */
-export function handleConditionalRequest(
+export function createConditionalResponse(
   request: Request,
   cachedResponse: Response,
 ): Response | null {
-  const ifNoneMatch = request.headers.get("if-none-match")
-  const ifModifiedSince = request.headers.get("if-modified-since")
+  const clientEtag = request.headers.get("if-none-match")
+  const clientModifiedSince = request.headers.get("if-modified-since")
 
   // Handle ETag-based conditional requests
-  if (ifNoneMatch) {
-    const etag = cachedResponse.headers.get("etag")
-    if (etag && (ifNoneMatch === "*" || ifNoneMatch.includes(etag))) {
+  if (clientEtag) {
+    const serverEtag = cachedResponse.headers.get("etag")
+    const isEtagMatch =
+      serverEtag && (clientEtag === "*" || clientEtag.includes(serverEtag))
+
+    if (isEtagMatch) {
       return new Response(null, {
         status: 304,
         headers: {
-          etag: etag,
+          etag: serverEtag,
           "cache-control": cachedResponse.headers.get("cache-control") || "",
           "last-modified": cachedResponse.headers.get("last-modified") || "",
         },
@@ -188,16 +209,20 @@ export function handleConditionalRequest(
   }
 
   // Handle Last-Modified-based conditional requests
-  if (ifModifiedSince && !ifNoneMatch) {
-    const lastModified = cachedResponse.headers.get("last-modified")
-    if (lastModified) {
-      const ifModifiedSinceTime = new Date(ifModifiedSince).getTime()
-      const lastModifiedTime = new Date(lastModified).getTime()
-      if (lastModifiedTime <= ifModifiedSinceTime) {
+  const shouldCheckModifiedSince = clientModifiedSince && !clientEtag
+  if (shouldCheckModifiedSince) {
+    const serverLastModified = cachedResponse.headers.get("last-modified")
+
+    if (serverLastModified) {
+      const clientTime = new Date(clientModifiedSince).getTime()
+      const serverTime = new Date(serverLastModified).getTime()
+      const isNotModified = serverTime <= clientTime
+
+      if (isNotModified) {
         return new Response(null, {
           status: 304,
           headers: {
-            "last-modified": lastModified,
+            "last-modified": serverLastModified,
             "cache-control": cachedResponse.headers.get("cache-control") || "",
           },
         })
@@ -214,7 +239,7 @@ export function handleConditionalRequest(
 async function handleCacheApiRequest(
   cache: Cache,
   cacheRequest: Request,
-  request: Request | undefined,
+  originalRequest: Request | undefined,
   config: CacheConfig,
   cacheKey: string,
 ): Promise<{ response: Response; cacheResult: CacheResult } | null> {
@@ -223,9 +248,9 @@ async function handleCacheApiRequest(
     if (!cachedResponse) return null
 
     // Handle conditional requests if original request is provided
-    if (request) {
-      const conditionalResponse = handleConditionalRequest(
-        request,
+    if (originalRequest) {
+      const conditionalResponse = createConditionalResponse(
+        originalRequest,
         cachedResponse,
       )
       if (conditionalResponse) {
@@ -241,9 +266,9 @@ async function handleCacheApiRequest(
     }
 
     // Clone the response and add cache debug headers - use clone() to avoid body consumption issues
-    const response = cachedResponse.clone()
+    const clonedResponse = cachedResponse.clone()
     if (config.debug) {
-      response.headers.set(
+      clonedResponse.headers.set(
         "X-Cache-Debug",
         JSON.stringify({
           hit: true,
@@ -254,7 +279,7 @@ async function handleCacheApiRequest(
     }
 
     return {
-      response,
+      response: clonedResponse,
       cacheResult: { hit: true, source: "cache", key: cacheKey },
     }
   } catch (cacheError) {
@@ -274,26 +299,35 @@ async function storeInCacheApi(
   config: CacheConfig,
   isEdgeHit: boolean,
 ): Promise<void> {
-  if (!response.ok || !canCache(response, method) || isEdgeHit) {
+  const shouldSkipStorage =
+    !response.ok || !isCacheable(response, method) || isEdgeHit
+
+  if (shouldSkipStorage) {
     return
   }
 
   try {
-    const ttl = calculateTtl(response, config)
+    const calculatedTtl = calculateTtl(response, config)
     // Clone the response to avoid body consumption issues
-    const cacheResponse = response.clone()
+    const responseClone = response.clone()
 
     // Add cache headers - create new response with modified headers to make them mutable
-    const responseWithHeaders = new Response(cacheResponse.body, {
-      status: cacheResponse.status,
-      statusText: cacheResponse.statusText,
-      headers: new Headers(cacheResponse.headers),
+    const responseWithCacheHeaders = new Response(responseClone.body, {
+      status: responseClone.status,
+      statusText: responseClone.statusText,
+      headers: new Headers(responseClone.headers),
     })
-    responseWithHeaders.headers.set("Cache-Control", `max-age=${ttl}`)
-    responseWithHeaders.headers.set("X-Cache-Stored", new Date().toISOString())
+    responseWithCacheHeaders.headers.set(
+      "Cache-Control",
+      `max-age=${calculatedTtl}`,
+    )
+    responseWithCacheHeaders.headers.set(
+      "X-Cache-Stored",
+      new Date().toISOString(),
+    )
 
     // Store in Cache API (fire and forget)
-    cache.put(cacheRequest, responseWithHeaders).catch((putError) => {
+    cache.put(cacheRequest, responseWithCacheHeaders).catch((putError) => {
       console.warn("Failed to store in Cache API:", putError)
     })
   } catch (storeError) {

@@ -3,24 +3,27 @@ export const parseInteger = (
   value: number | string | undefined,
   fieldName: string,
 ): number => {
-  if (value === undefined || value === null) {
+  const isMissing = value === undefined || value === null
+  if (isMissing) {
     throw new Error(`${fieldName} binding is missing`)
   }
 
   // If it's already a number, validate and return it
   if (typeof value === "number") {
-    if (Number.isNaN(value) || !Number.isInteger(value)) {
+    const isValidInteger = !Number.isNaN(value) && Number.isInteger(value)
+    if (!isValidInteger) {
       throw new Error(`${fieldName} is not a valid integer`)
     }
     return value
   }
 
   // If it's a string, parse it
-  const parsedNumber = Number.parseInt(value, 10)
-  if (Number.isNaN(parsedNumber)) {
+  const parsedInteger = Number.parseInt(value, 10)
+  const isValidParsedInteger = !Number.isNaN(parsedInteger)
+  if (!isValidParsedInteger) {
     throw new Error(`${fieldName} is not a valid integer`)
   }
-  return parsedNumber
+  return parsedInteger
 }
 
 /**
@@ -28,10 +31,10 @@ export const parseInteger = (
  * This ensures proper encoding where spaces become %20 (not +) and special characters
  * are handled according to AWS specifications.
  */
-export function rfc3986Encode(str: string): string {
-  return encodeURIComponent(str).replace(
+export function rfc3986Encode(inputString: string): string {
+  return encodeURIComponent(inputString).replace(
     /[!'()*]/g,
-    (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`,
+    (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
   )
 }
 
@@ -44,26 +47,28 @@ export function rfc3986Encode(str: string): string {
  */
 export function createCanonicalQueryString(
   searchParams: URLSearchParams,
-  excludeParam?: string,
+  excludedParamName?: string,
 ): string {
-  const params: Array<[string, string]> = []
+  const parameterPairs: Array<[string, string]> = []
 
   // Collect all parameters except the excluded one (typically 'sig')
-  for (const [name, value] of searchParams.entries()) {
-    if (!excludeParam || name !== excludeParam) {
-      params.push([name, value])
+  for (const [paramName, paramValue] of searchParams.entries()) {
+    const shouldIncludeParam =
+      !excludedParamName || paramName !== excludedParamName
+    if (shouldIncludeParam) {
+      parameterPairs.push([paramName, paramValue])
     }
   }
 
   // Sort parameters by name (case-sensitive alphabetical order)
-  params.sort(([a], [b]) => a.localeCompare(b))
+  parameterPairs.sort(([nameA], [nameB]) => nameA.localeCompare(nameB))
 
   // Encode and format each parameter using RFC3986 encoding
-  const encodedParams = params.map(
+  const encodedParameters = parameterPairs.map(
     ([name, value]) => `${rfc3986Encode(name)}=${rfc3986Encode(value)}`,
   )
 
-  return encodedParams.join("&")
+  return encodedParameters.join("&")
 }
 
 /**
@@ -74,19 +79,26 @@ export const getBooleanEnv = (
   value: boolean | string | undefined,
   defaultValue: boolean,
 ): boolean => {
-  if (value === undefined || value === null) {
+  const isMissing = value === undefined || value === null
+  if (isMissing) {
     return defaultValue
   }
+
   if (typeof value === "boolean") {
     return value
   }
-  const lowerValue = value.toLowerCase()
-  if (lowerValue === "false" || lowerValue === "0") {
+
+  const normalizedValue = value.toLowerCase()
+  const isFalsyString = normalizedValue === "false" || normalizedValue === "0"
+  if (isFalsyString) {
     return false
   }
-  if (lowerValue === "true" || lowerValue === "1") {
+
+  const isTruthyString = normalizedValue === "true" || normalizedValue === "1"
+  if (isTruthyString) {
     return true
   }
+
   return defaultValue
 }
 
@@ -102,13 +114,16 @@ function removePathTraversalCharacters(filename: string): string {
  */
 function removeProblematicCharacters(filename: string): string {
   // Keep only alphanumeric, dot, hyphen, underscore, space, and some safe punctuation
-  let sanitized = filename.replace(/[^a-zA-Z0-9._\-\s()[\]]/g, "")
+  let sanitizedFilename = filename.replace(/[^a-zA-Z0-9._\-\s()[\]]/g, "")
 
   // Strip control characters (including Unicode control characters)
   // biome-ignore lint/suspicious/noControlCharactersInRegex: Unicode ranges needed for security validation
-  sanitized = sanitized.replace(/[\u0000-\u001F\u007F\u0080-\u009F]/g, "")
+  sanitizedFilename = sanitizedFilename.replace(
+    /[\u0000-\u001F\u007F\u0080-\u009F]/g,
+    "",
+  )
 
-  return sanitized
+  return sanitizedFilename
 }
 
 /**
@@ -119,24 +134,28 @@ function normalizeWhitespace(filename: string): string {
 }
 
 /**
- * Removes problematic starting characters
+ * Checks if filename starts with problematic characters
  */
-function removeProblematicStartingCharacters(filename: string): string {
-  if (
+function startsWithProblematicChar(filename: string): boolean {
+  return (
     filename.startsWith(".") ||
     filename.startsWith("-") ||
     filename.startsWith("_")
-  ) {
-    return filename.substring(1)
-  }
-  return filename
+  )
+}
+
+/**
+ * Removes problematic starting characters
+ */
+function removeProblematicStartingCharacters(filename: string): string {
+  return startsWithProblematicChar(filename) ? filename.substring(1) : filename
 }
 
 /**
  * Checks if filename is a Windows reserved name
  */
 function isWindowsReservedName(filename: string): boolean {
-  const reservedNames = [
+  const windowsReservedNames = [
     "CON",
     "PRN",
     "AUX",
@@ -160,8 +179,22 @@ function isWindowsReservedName(filename: string): boolean {
     "LPT8",
     "LPT9",
   ]
-  const nameWithoutExt = filename.split(".")[0]?.toUpperCase() ?? ""
-  return reservedNames.includes(nameWithoutExt)
+  const filenameWithoutExtension = filename.split(".")[0]?.toUpperCase() ?? ""
+  return windowsReservedNames.includes(filenameWithoutExtension)
+}
+
+/**
+ * Checks if filename is empty after sanitization
+ */
+function isEmptyFilename(filename: string): boolean {
+  return !filename || filename.length === 0
+}
+
+/**
+ * Checks if filename exceeds maximum length
+ */
+function exceedsMaxLength(filename: string, maxLength: number): boolean {
+  return filename.length > maxLength
 }
 
 /**
@@ -169,32 +202,33 @@ function isWindowsReservedName(filename: string): boolean {
  * Prevents security issues in filename handling across different browsers and file systems.
  */
 export function sanitizeDownloadFilename(
-  dlName: string,
-  defaultName: string,
+  requestedFilename: string,
+  fallbackFilename: string,
 ): string {
   // Remove leading/trailing whitespace
-  let sanitized = dlName.trim()
+  let sanitizedName = requestedFilename.trim()
 
   // Prevent excessively long filenames
-  if (sanitized.length > 255) {
-    sanitized = sanitized.substring(0, 255)
+  const maxFilenameLength = 255
+  if (exceedsMaxLength(sanitizedName, maxFilenameLength)) {
+    sanitizedName = sanitizedName.substring(0, maxFilenameLength)
   }
 
   // Apply sanitization steps
-  sanitized = removePathTraversalCharacters(sanitized)
-  sanitized = removeProblematicCharacters(sanitized)
-  sanitized = normalizeWhitespace(sanitized)
-  sanitized = removeProblematicStartingCharacters(sanitized)
+  sanitizedName = removePathTraversalCharacters(sanitizedName)
+  sanitizedName = removeProblematicCharacters(sanitizedName)
+  sanitizedName = normalizeWhitespace(sanitizedName)
+  sanitizedName = removeProblematicStartingCharacters(sanitizedName)
 
   // Ensure filename has valid content and isn't empty
-  if (!sanitized || sanitized.length === 0) {
-    return defaultName
+  if (isEmptyFilename(sanitizedName)) {
+    return fallbackFilename
   }
 
   // Prevent reserved filenames on Windows
-  if (isWindowsReservedName(sanitized)) {
-    return defaultName
+  if (isWindowsReservedName(sanitizedName)) {
+    return fallbackFilename
   }
 
-  return sanitized
+  return sanitizedName
 }

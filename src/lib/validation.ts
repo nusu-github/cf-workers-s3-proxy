@@ -14,9 +14,12 @@ const booleanTransform = z
   .transform((value) => {
     if (typeof value === "boolean") return value
 
-    const normalized = value.toLowerCase()
-    if (normalized === "true" || normalized === "1") return true
-    if (normalized === "false" || normalized === "0") return false
+    const normalizedValue = value.toLowerCase()
+    const isTruthy = normalizedValue === "true" || normalizedValue === "1"
+    const isFalsy = normalizedValue === "false" || normalizedValue === "0"
+
+    if (isTruthy) return true
+    if (isFalsy) return false
 
     throw new Error("must be a boolean value (true/false or 1/0)")
   })
@@ -28,11 +31,13 @@ const integerTransform = z
   .transform((value) => {
     if (typeof value === "number") return value
 
-    const parsedNumber = Number.parseInt(String(value), 10)
-    if (Number.isNaN(parsedNumber)) {
+    const parsedInteger = Number.parseInt(String(value), 10)
+    const isValidInteger = !Number.isNaN(parsedInteger)
+
+    if (!isValidInteger) {
       throw new Error("must be a valid integer")
     }
-    return parsedNumber
+    return parsedInteger
   })
 
 /**
@@ -48,8 +53,8 @@ function createRangedInteger(minValue: number, maxValue: number) {
 
 function isValidHttpUrl(url: string): boolean {
   try {
-    const parsed = new URL(url)
-    return parsed.protocol.startsWith("http")
+    const parsedUrl = new URL(url)
+    return parsedUrl.protocol.startsWith("http")
   } catch {
     return false
   }
@@ -69,10 +74,13 @@ const awsRegionSchema = z
     "must be a valid AWS region identifier (e.g., us-east-1, eu-west-1)",
   )
 
-function isValidS3BucketName(name: string): boolean {
-  if (name.includes("..")) return false
-  if (name.startsWith(".") || name.endsWith(".")) return false
-  return true
+function isValidS3BucketName(bucketName: string): boolean {
+  const hasConsecutiveDots = bucketName.includes("..")
+  const startsWithDot = bucketName.startsWith(".")
+  const endsWithDot = bucketName.endsWith(".")
+
+  const hasInvalidDotUsage = hasConsecutiveDots || startsWithDot || endsWithDot
+  return !hasInvalidDotUsage
 }
 
 // S3 bucket name validation according to AWS specifications
@@ -88,12 +96,16 @@ const s3BucketNameSchema = z
     message: "must not contain consecutive dots or start/end with dots",
   })
 
-function validateCorsOrigins(origins: string | undefined): boolean {
-  if (!origins || origins === "*") return true
+function validateCorsOrigins(originsList: string | undefined): boolean {
+  const isWildcardOrEmpty = !originsList || originsList === "*"
+  if (isWildcardOrEmpty) return true
 
-  const originList = origins.split(",").map((origin) => origin.trim())
-  return originList.every((origin) => {
-    if (!origin || origin === "*") return true
+  const individualOrigins = originsList
+    .split(",")
+    .map((origin) => origin.trim())
+  return individualOrigins.every((origin) => {
+    const isWildcardOrEmpty = !origin || origin === "*"
+    if (isWildcardOrEmpty) return true
 
     try {
       new URL(origin)
@@ -109,11 +121,15 @@ const corsOriginsSchema = z.string().optional().refine(validateCorsOrigins, {
   message: "Invalid CORS origin format. Must be a valid URL or '*'",
 })
 
-function validateUrlSigningPaths(paths: string | undefined): boolean {
-  if (!paths) return true
+function validateUrlSigningPaths(pathsList: string | undefined): boolean {
+  if (!pathsList) return true
 
-  const pathList = paths.split(",").map((path) => path.trim())
-  return pathList.every((path) => !path || path.startsWith("/"))
+  const individualPaths = pathsList.split(",").map((path) => path.trim())
+  return individualPaths.every((path) => {
+    const isEmpty = !path
+    const startsWithSlash = path.startsWith("/")
+    return isEmpty || startsWithSlash
+  })
 }
 
 // URL signing paths validation - ensures all paths start with '/'
@@ -124,26 +140,28 @@ const urlSigningPathsSchema = z
     message: "Paths must start with '/'",
   })
 
-function hasMinimumSecretLength(secret: string | undefined): boolean {
-  return !secret || secret.length >= 32
+function hasMinimumSecretLength(signingSecret: string | undefined): boolean {
+  const minRequiredLength = 32
+  return !signingSecret || signingSecret.length >= minRequiredLength
 }
 
-function hasAdequateEntropy(secret: string | undefined): boolean {
-  if (!secret) return true
+function hasAdequateEntropy(signingSecret: string | undefined): boolean {
+  if (!signingSecret) return true
 
-  const hasLowercase = /[a-z]/.test(secret)
-  const hasUppercase = /[A-Z]/.test(secret)
-  const hasNumbers = /[0-9]/.test(secret)
-  const hasSpecialChars = /[^a-zA-Z0-9]/.test(secret)
+  const hasLowercase = /[a-z]/.test(signingSecret)
+  const hasUppercase = /[A-Z]/.test(signingSecret)
+  const hasNumbers = /[0-9]/.test(signingSecret)
+  const hasSpecialChars = /[^a-zA-Z0-9]/.test(signingSecret)
 
-  const entropyScore = [
+  const characterTypeCount = [
     hasLowercase,
     hasUppercase,
     hasNumbers,
     hasSpecialChars,
   ].filter(Boolean).length
 
-  return entropyScore >= 2
+  const minRequiredCharacterTypes = 2
+  return characterTypeCount >= minRequiredCharacterTypes
 }
 
 // URL signing secret validation with length and entropy requirements
@@ -164,7 +182,8 @@ function validateCacheTtlRelationship(data: {
 }): boolean {
   const { CACHE_MIN_TTL_SECONDS: minTtl, CACHE_MAX_TTL_SECONDS: maxTtl } = data
 
-  if (minTtl !== undefined && maxTtl !== undefined) {
+  const bothValuesPresent = minTtl !== undefined && maxTtl !== undefined
+  if (bothValuesPresent) {
     return minTtl <= maxTtl
   }
   return true
@@ -174,8 +193,12 @@ function validateUrlSigningConfiguration(data: {
   ENFORCE_URL_SIGNING?: boolean
   URL_SIGNING_SECRET?: string
 }): boolean {
-  const isEnforced = getBooleanEnv(data.ENFORCE_URL_SIGNING, false)
-  return !(isEnforced && !data.URL_SIGNING_SECRET)
+  const isSigningEnforced = getBooleanEnv(data.ENFORCE_URL_SIGNING, false)
+  const hasSigningSecret = Boolean(data.URL_SIGNING_SECRET)
+
+  // If signing is enforced, a secret must be provided
+  const isValidConfiguration = !isSigningEnforced || hasSigningSecret
+  return isValidConfiguration
 }
 
 function validateUrlSigningPathsConfiguration(data: {
@@ -183,16 +206,19 @@ function validateUrlSigningPathsConfiguration(data: {
   URL_SIGNING_SECRET?: string
 }): boolean {
   const {
-    URL_SIGNING_REQUIRED_PATHS: requiredPaths,
-    URL_SIGNING_SECRET: secret,
+    URL_SIGNING_REQUIRED_PATHS: requiredPathsString,
+    URL_SIGNING_SECRET: signingSecret,
   } = data
 
-  if (!requiredPaths) return true
+  if (!requiredPathsString) return true
 
-  const pathList = requiredPaths.split(",").map((path) => path.trim())
-  const hasValidPaths = pathList.length > 0 && pathList.some((path) => path)
+  const pathsList = requiredPathsString.split(",").map((path) => path.trim())
+  const hasValidPaths = pathsList.length > 0 && pathsList.some((path) => path)
+  const hasSigningSecret = Boolean(signingSecret)
 
-  return !(hasValidPaths && !secret)
+  // If paths are configured, a secret must be provided
+  const isValidConfiguration = !hasValidPaths || hasSigningSecret
+  return isValidConfiguration
 }
 
 // Environment validation schema with comprehensive checks
@@ -251,8 +277,8 @@ const envSchema = z
     path: ["URL_SIGNING_SECRET"],
   })
 
-function formatValidationErrors(errors: z.ZodIssue[]): string {
-  const errorMessages = errors.map((error) => {
+function formatValidationErrors(validationErrors: z.ZodIssue[]): string {
+  const formattedErrorMessages = validationErrors.map((error) => {
     const fieldPath = error.path.join(".")
     return `${fieldPath} ${error.message}`
   })
@@ -260,7 +286,7 @@ function formatValidationErrors(errors: z.ZodIssue[]): string {
   return [
     "❌ Environment variable validation failed:",
     "",
-    ...errorMessages.map((error) => `  • ${error}`),
+    ...formattedErrorMessages.map((error) => `  • ${error}`),
     "",
     "Please check your wrangler.jsonc configuration and environment variables.",
     "Refer to the documentation for proper configuration values.",
@@ -274,12 +300,14 @@ function formatValidationErrors(errors: z.ZodIssue[]): string {
 export function validateEnvironment(env: Env): void {
   try {
     envSchema.parse(env)
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      const formattedError = formatValidationErrors(error.errors)
-      throw new Error(formattedError)
+  } catch (validationError) {
+    if (validationError instanceof z.ZodError) {
+      const formattedErrorMessage = formatValidationErrors(
+        validationError.errors,
+      )
+      throw new Error(formattedErrorMessage)
     }
-    throw error
+    throw validationError
   }
 }
 

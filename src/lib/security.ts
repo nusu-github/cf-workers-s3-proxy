@@ -2,27 +2,31 @@ import { HTTPException } from "hono/http-exception"
 
 import { createCanonicalQueryString, parseInteger } from "./utils.js"
 
-const globalEncoder = new TextEncoder()
+const textEncoder = new TextEncoder()
 
 /**
  * Enhanced URL signature verification following AWS S3 Signature Version 4 standards.
  */
 export const verifySignature = async (
   url: URL,
-  secret: string,
+  signingSecret: string,
 ): Promise<void> => {
-  const sig = url.searchParams.get("sig")
-  const exp = url.searchParams.get("exp")
+  const providedSignature = url.searchParams.get("sig")
+  const expirationTimestamp = url.searchParams.get("exp")
 
   // Missing signature or expiration - return 403 Forbidden
-  if (!sig || !exp) {
+  const hasMissingAuthParams = !providedSignature || !expirationTimestamp
+  if (hasMissingAuthParams) {
     throw new HTTPException(403, {
       message: "Missing signature or expiration",
     })
   }
 
   // Check if URL has expired - return 403 Forbidden
-  if (Date.now() > Number(exp) * 1000) {
+  const expirationTimeMs = Number(expirationTimestamp) * 1000
+  const isExpired = Date.now() > expirationTimeMs
+
+  if (isExpired) {
     throw new HTTPException(403, { message: "URL expired" })
   }
 
@@ -35,44 +39,51 @@ export const verifySignature = async (
 
   // Construct data to sign: pathname + canonical query string
   // Only append '?' if there are query parameters (AWS S3 standard)
-  const dataToSign = canonicalQueryString
+  const hasQueryParams = canonicalQueryString.length > 0
+  const dataToSign = hasQueryParams
     ? `${url.pathname}?${canonicalQueryString}`
     : url.pathname
 
   // Import HMAC key for verification
-  const hmacKey = await crypto.subtle.importKey(
+  const hmacSigningKey = await crypto.subtle.importKey(
     "raw",
-    globalEncoder.encode(secret),
+    textEncoder.encode(signingSecret),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["verify"], // Only need verify capability for signature validation
   )
 
   // Convert received hex signature to bytes for verification
-  let receivedSigBytes: Uint8Array
+  let receivedSignatureBytes: Uint8Array
   try {
-    const matchedBytes = sig.match(/.{1,2}/g)
-    if (!matchedBytes) {
+    const hexByteMatches = providedSignature.match(/.{1,2}/g)
+    const hasValidHexFormat = hexByteMatches !== null
+
+    if (!hasValidHexFormat) {
       throw new Error("Signature format is invalid - no hex bytes found")
     }
-    receivedSigBytes = new Uint8Array(
-      matchedBytes.map((byte) => Number.parseInt(byte, 16)),
+
+    receivedSignatureBytes = new Uint8Array(
+      hexByteMatches.map((hexByte) => Number.parseInt(hexByte, 16)),
     )
-  } catch (e: unknown) {
-    const message = e instanceof Error ? e.message : "Invalid signature format"
-    throw new HTTPException(403, { message }) // 403 for invalid signature format
+  } catch (conversionError: unknown) {
+    const errorMessage =
+      conversionError instanceof Error
+        ? conversionError.message
+        : "Invalid signature format"
+    throw new HTTPException(403, { message: errorMessage })
   }
 
   // Verify the signature using Web Crypto API
-  const valid = await crypto.subtle.verify(
+  const isValidSignature = await crypto.subtle.verify(
     { name: "HMAC", hash: "SHA-256" },
-    hmacKey,
-    receivedSigBytes,
-    globalEncoder.encode(dataToSign),
+    hmacSigningKey,
+    receivedSignatureBytes,
+    textEncoder.encode(dataToSign),
   )
 
   // Invalid signature - return 403 Forbidden (not 401 Unauthorized)
-  if (!valid) {
+  if (!isValidSignature) {
     throw new HTTPException(403, { message: "Invalid signature" })
   }
 }
@@ -80,10 +91,12 @@ export const verifySignature = async (
 /**
  * Validates prefix length against configured limits
  */
-function validatePrefixLength(prefix: string, maxLength: number): void {
-  if (prefix.length > maxLength) {
+function validatePrefixLength(prefix: string, maxAllowedLength: number): void {
+  const exceedsMaxLength = prefix.length > maxAllowedLength
+
+  if (exceedsMaxLength) {
     throw new HTTPException(400, {
-      message: `Prefix too long. Maximum length is ${maxLength} characters.`,
+      message: `Prefix too long. Maximum length is ${maxAllowedLength} characters.`,
     })
   }
 }
@@ -104,9 +117,12 @@ function validateNoPathTraversal(prefix: string): void {
     "%2E%2E%5C", // URL encoded ..\
   ]
 
-  const lowerPrefix = prefix.toLowerCase()
-  for (const pattern of traversalPatterns) {
-    if (lowerPrefix.includes(pattern)) {
+  const lowercasePrefix = prefix.toLowerCase()
+
+  for (const dangerousPattern of traversalPatterns) {
+    const containsTraversalPattern = lowercasePrefix.includes(dangerousPattern)
+
+    if (containsTraversalPattern) {
       throw new HTTPException(400, {
         message: "Path traversal detected in prefix parameter.",
       })
@@ -114,12 +130,13 @@ function validateNoPathTraversal(prefix: string): void {
   }
 
   // Additional path traversal checks
-  if (
+  const hasTraversalSequences =
     prefix.startsWith("../") ||
     prefix.endsWith("/..") ||
     prefix.includes("/../") ||
     prefix === ".."
-  ) {
+
+  if (hasTraversalSequences) {
     throw new HTTPException(400, {
       message: "Path traversal detected in prefix parameter.",
     })
@@ -132,20 +149,25 @@ function validateNoPathTraversal(prefix: string): void {
 function sanitizeAndValidateCharacters(prefix: string): string {
   // Remove control characters (0x00-0x1F, 0x7F) and other problematic characters
   // biome-ignore lint/suspicious/noControlCharactersInRegex: Unicode ranges needed for security validation
-  const sanitized = prefix.replace(/[\u0000-\u001F\u007F\u0080-\u009F]/g, "")
+  const withoutControlChars = prefix.replace(
+    /[\u0000-\u001F\u007F\u0080-\u009F]/g,
+    "",
+  )
 
   // Validate allowed characters for S3 object keys
   // S3 allows: letters, numbers, and these special characters: ! - _ . * ' ( ) /
   // A more restrictive set of characters is enforced for security.
-  const allowedPattern = /^[a-zA-Z0-9\-_.\/'()*!]*$/
-  if (!allowedPattern.test(sanitized)) {
+  const allowedCharacterPattern = /^[a-zA-Z0-9\-_.\/'()*!]*$/
+  const hasOnlyAllowedChars = allowedCharacterPattern.test(withoutControlChars)
+
+  if (!hasOnlyAllowedChars) {
     throw new HTTPException(400, {
       message:
         "Prefix contains invalid characters. Only letters, numbers, and these special characters are allowed: - _ . / ' ( ) * !",
     })
   }
 
-  return sanitized
+  return withoutControlChars
 }
 
 /**
@@ -153,35 +175,45 @@ function sanitizeAndValidateCharacters(prefix: string): string {
  */
 function normalizePath(prefix: string): string {
   // Normalize path separators and remove consecutive slashes
-  let normalized = prefix.replace(/\\+/g, "/").replace(/\/+/g, "/")
+  let normalizedPath = prefix.replace(/\\+/g, "/").replace(/\/+/g, "/")
 
   // Remove leading slash if present (S3 object keys shouldn't start with /)
-  if (normalized.startsWith("/")) {
-    normalized = normalized.substring(1)
+  const hasLeadingSlash = normalizedPath.startsWith("/")
+  if (hasLeadingSlash) {
+    normalizedPath = normalizedPath.substring(1)
   }
 
-  return normalized
+  return normalizedPath
 }
 
 /**
  * Validates prefix depth and segment length constraints
  */
-function validatePrefixStructure(prefix: string, maxDepth: number): void {
+function validatePrefixStructure(
+  prefix: string,
+  maxAllowedDepth: number,
+): void {
   if (prefix === "") return
 
   // Limit depth to prevent overly complex prefix structures
-  const depth = prefix.split("/").length
-  if (depth > maxDepth) {
+  const pathSegments = prefix.split("/")
+  const currentDepth = pathSegments.length
+  const exceedsMaxDepth = currentDepth > maxAllowedDepth
+
+  if (exceedsMaxDepth) {
     throw new HTTPException(400, {
-      message: `Prefix depth exceeds maximum allowed (${maxDepth} levels).`,
+      message: `Prefix depth exceeds maximum allowed (${maxAllowedDepth} levels).`,
     })
   }
 
   // Additional security: reject prefixes that are suspiciously long relative to depth
-  if (depth > 0) {
-    const avgSegmentLength = prefix.length / depth
-    if (avgSegmentLength > 128) {
-      // Configurable threshold
+  if (currentDepth > 0) {
+    const averageSegmentLength = prefix.length / currentDepth
+    const maxReasonableSegmentLength = 128 // Configurable threshold
+    const hasExcessivelyLongSegments =
+      averageSegmentLength > maxReasonableSegmentLength
+
+    if (hasExcessivelyLongSegments) {
       throw new HTTPException(400, {
         message: "Prefix segments are excessively long.",
       })
@@ -198,79 +230,94 @@ export function validateAndSanitizePrefix(prefix: string, env: Env): string {
   if (!prefix) return ""
 
   // Remove leading/trailing whitespace
-  let sanitized = prefix.trim()
+  let sanitizedPrefix = prefix.trim()
 
   // Get configuration limits with defaults
-  const maxLength = parseInteger(
+  const maxPrefixLength = parseInteger(
     env.PREFIX_MAX_LENGTH ?? "512",
     "PREFIX_MAX_LENGTH",
   )
-  const maxDepth = parseInteger(
+  const maxPrefixDepth = parseInteger(
     env.PREFIX_MAX_DEPTH ?? "10",
     "PREFIX_MAX_DEPTH",
   )
 
   // Validate prefix length
-  validatePrefixLength(sanitized, maxLength)
+  validatePrefixLength(sanitizedPrefix, maxPrefixLength)
 
   // Prevent path traversal attempts
-  validateNoPathTraversal(sanitized)
+  validateNoPathTraversal(sanitizedPrefix)
 
   // Sanitize characters and validate allowed character set
-  sanitized = sanitizeAndValidateCharacters(sanitized)
+  sanitizedPrefix = sanitizeAndValidateCharacters(sanitizedPrefix)
 
   // Normalize path structure
-  sanitized = normalizePath(sanitized)
+  sanitizedPrefix = normalizePath(sanitizedPrefix)
 
   // Validate prefix structure constraints
-  validatePrefixStructure(sanitized, maxDepth)
+  validatePrefixStructure(sanitizedPrefix, maxPrefixDepth)
 
-  return sanitized
+  return sanitizedPrefix
 }
 
 /**
  * Determines if URL signing should be enforced for the given request.
  * This provides configurable URL signing enforcement for security.
  */
-export function shouldEnforceUrlSigning(env: Env, pathname: string): boolean {
+export function shouldEnforceUrlSigning(
+  env: Env,
+  requestPathname: string,
+): boolean {
   // If no signing secret is configured, signing cannot be enforced
-  if (!env.URL_SIGNING_SECRET) {
+  const hasSigningSecret = Boolean(env.URL_SIGNING_SECRET)
+  if (!hasSigningSecret) {
     return false
   }
 
   // Helper to handle boolean/string environment variable
-  const getBooleanValue = (value: boolean | string | undefined): boolean => {
+  const parseBooleanEnvVar = (value: boolean | string | undefined): boolean => {
     if (typeof value === "boolean") {
       return value
     }
     if (typeof value === "string") {
-      return value === "true" || value === "1"
+      const isTrue = value === "true" || value === "1"
+      return isTrue
     }
     return false
   }
 
   // If global enforcement is enabled
-  if (getBooleanValue(env.ENFORCE_URL_SIGNING)) {
+  const isGlobalEnforcementEnabled = parseBooleanEnvVar(env.ENFORCE_URL_SIGNING)
+  if (isGlobalEnforcementEnabled) {
     return true
   }
 
   // Check if specific paths require signing
-  if (env.URL_SIGNING_REQUIRED_PATHS) {
-    const requiredPaths = env.URL_SIGNING_REQUIRED_PATHS.split(",")
-      .map((p) => p.trim())
-      .filter((p) => p.length > 0)
+  const hasSpecificPathRequirements = Boolean(env.URL_SIGNING_REQUIRED_PATHS)
+  if (hasSpecificPathRequirements) {
+    const requiredPathsString = env.URL_SIGNING_REQUIRED_PATHS
+    const requiredPaths = requiredPathsString
+      .split(",")
+      .map((pathPattern) => pathPattern.trim())
+      .filter((pathPattern) => pathPattern.length > 0)
 
-    return requiredPaths.some((requiredPath) => {
+    const matchesRequiredPath = requiredPaths.some((requiredPath) => {
       // Support wildcard matching
-      if (requiredPath.endsWith("*")) {
-        const prefix = requiredPath.slice(0, -1)
-        return pathname.startsWith(prefix)
+      const isWildcardPattern = requiredPath.endsWith("*")
+
+      if (isWildcardPattern) {
+        const pathPrefix = requiredPath.slice(0, -1)
+        return requestPathname.startsWith(pathPrefix)
       }
+
       // Exact match or path starts with required path + "/"
-      return (
-        pathname === requiredPath || pathname.startsWith(`${requiredPath}/`)
-      )
+      const isExactMatch = requestPathname === requiredPath
+      const isSubPath = requestPathname.startsWith(`${requiredPath}/`)
+
+      return isExactMatch || isSubPath
     })
+
+    return matchesRequiredPath
   }
 
   return false

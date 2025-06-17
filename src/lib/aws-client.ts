@@ -22,12 +22,25 @@ export function getAwsClient(env: Env): AwsClient {
 export const getS3BaseUrl = (env: Env) => `${env.END_POINT}/${env.BUCKET_NAME}`
 
 /**
+ * Checks if expiration time is within S3 limits
+ */
+function hasValidExpirationTime(expiresInSeconds: number): boolean {
+  const minExpirationSeconds = 1
+  const maxExpirationSeconds = 604800 // 7 days
+
+  return (
+    expiresInSeconds >= minExpirationSeconds &&
+    expiresInSeconds <= maxExpirationSeconds
+  )
+}
+
+/**
  * Generate presigned URL for S3 operations
  * @param signer - AWS client instance
  * @param url - S3 object URL
  * @param method - HTTP method
  * @param headers - Request headers
- * @param expiresIn - Expiration time in seconds (1-604800)
+ * @param expiresInSeconds - Expiration time in seconds (1-604800)
  * @returns Presigned URL string
  */
 export async function generatePresignedUrl(
@@ -35,12 +48,12 @@ export async function generatePresignedUrl(
   url: string,
   method: HttpMethod,
   headers = new Headers(),
-  expiresIn = 3600,
+  expiresInSeconds = 3600,
 ): Promise<string> {
   // Validate expiration time (S3 limits: 1 second to 7 days)
-  if (expiresIn < 1 || expiresIn > 604800) {
+  if (!hasValidExpirationTime(expiresInSeconds)) {
     throw new Error(
-      "expiresIn must be between 1 second and 7 days (604800 seconds)",
+      "expiresInSeconds must be between 1 second and 7 days (604800 seconds)",
     )
   }
 
@@ -48,11 +61,11 @@ export async function generatePresignedUrl(
   const urlObj = new URL(url)
 
   // Add standard AWS presigned URL parameters
-  urlObj.searchParams.set("X-Amz-Expires", expiresIn.toString())
-  urlObj.searchParams.set(
-    "X-Amz-SignedHeaders",
-    Array.from(headers.keys()).sort().join(";"),
-  )
+  urlObj.searchParams.set("X-Amz-Expires", expiresInSeconds.toString())
+
+  const sortedHeaderKeys = Array.from(headers.keys()).sort()
+  const signedHeadersParam = sortedHeaderKeys.join(";")
+  urlObj.searchParams.set("X-Amz-SignedHeaders", signedHeadersParam)
 
   // Sign the request with aws4fetch
   const signedRequest = await signer.sign(urlObj.toString(), {
@@ -65,6 +78,13 @@ export async function generatePresignedUrl(
 }
 
 /**
+ * Checks if response should have content-range header for range requests
+ */
+function shouldHaveContentRange(method: HttpMethod, headers: Headers): boolean {
+  return method === HttpMethod.GET && headers.has("Range")
+}
+
+/**
  * Validates range request response
  */
 function validateRangeResponse(
@@ -72,7 +92,7 @@ function validateRangeResponse(
   headers: Headers,
   response: Response,
 ): void {
-  if (method === HttpMethod.GET && headers.has("Range")) {
+  if (shouldHaveContentRange(method, headers)) {
     if (!response.headers.has("content-range")) {
       throw new Error("Missing content-range")
     }
@@ -80,11 +100,18 @@ function validateRangeResponse(
 }
 
 /**
+ * Checks if response indicates server error
+ */
+function isServerError(response: Response): boolean {
+  return response.status >= 500
+}
+
+/**
  * Handles server error responses
  */
 function handleServerError(response: Response): Response {
   if (!response.ok) {
-    if (response.status >= 500) {
+    if (isServerError(response)) {
       throw new Error(
         `Upstream responded with server error: ${response.status}`,
       )
@@ -122,27 +149,33 @@ async function performS3FetchAttempt(
   return handledResponse
 }
 
-/** Build signed request and fetch with retry */
+/** Build signed request and fetch with retry logic and exponential backoff */
 export async function s3Fetch(
   signer: AwsClient,
   url: string,
   method: HttpMethod,
   headers: Headers,
-  attempts: number,
+  maxAttempts: number,
 ): Promise<Response> {
-  let attempt = 0
-  let lastErr: unknown
+  let attemptCount = 0
+  let lastError: unknown
 
-  while (attempt < attempts) {
+  while (attemptCount < maxAttempts) {
     try {
       return await performS3FetchAttempt(signer, url, method, headers)
-    } catch (e) {
-      lastErr = e
-      const backoff = 200 * 2 ** attempt + Math.random() * 100
-      await new Promise((r) => setTimeout(r, backoff))
-      attempt++
+    } catch (error) {
+      lastError = error
+
+      // Calculate exponential backoff with jitter
+      const baseDelayMs = 200
+      const exponentialFactor = 2 ** attemptCount
+      const jitterMs = Math.random() * 100
+      const backoffDelayMs = baseDelayMs * exponentialFactor + jitterMs
+
+      await new Promise((resolve) => setTimeout(resolve, backoffDelayMs))
+      attemptCount++
     }
   }
 
-  throw new Error(`Failed after ${attempts} attempts: ${String(lastErr)}`)
+  throw new Error(`Failed after ${maxAttempts} attempts: ${String(lastError)}`)
 }
