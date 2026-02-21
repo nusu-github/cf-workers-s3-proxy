@@ -10,7 +10,7 @@
     "test:signed": "URL_SIGNING_SECRET=${URL_SIGNING_SECRET} node upload-test.js"
   },
   "dependencies": {
-    "fast-xml-parser": "^4.3.4"
+    "fast-xml-parser": "^5.3.7"
   },
   "engines": {
     "node": ">=18.0.0"
