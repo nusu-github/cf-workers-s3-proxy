@@ -303,7 +303,7 @@ export function validateEnvironment(env: Env): void {
   } catch (validationError) {
     if (validationError instanceof z.ZodError) {
       const formattedErrorMessage = formatValidationErrors(
-        validationError.errors,
+        validationError.issues,
       )
       throw new Error(formattedErrorMessage)
     }
