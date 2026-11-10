@@ -38,7 +38,7 @@ const presignedUploadSchema = z.object({
       contentType: z.string().optional(),
       contentLength: z.number().int().min(0).optional(),
       contentMd5: z.string().optional(),
-      metadata: z.record(z.string()).optional(),
+      metadata: z.record(z.string(), z.string()).optional(),
     })
     .optional()
     .default({}),
